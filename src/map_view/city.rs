@@ -281,7 +281,7 @@ impl CodeMap {
                     }
                     if let Some(line) = self.text_cache.get(&panel.index).and_then(|text| text.lines.get(i)) {
                         if !line.text.trim().is_empty() {
-                            draw_source_line(&mut self.draw_code, cx2d, line, self.call_highlights.line(&node.path, i + 1), self.relationship_root.as_deref(), self.syntax_colors, dvec2(x, y), 1.0);
+                            draw_source_line(&mut self.draw_code, cx2d, line, self.call_highlights.line(&node.path, i + 1), self.relationship_root.as_deref(), self.syntax_colors, dvec2(x, y), local_line, 1.0);
                             text_budget -= 1;
                         }
                     }

@@ -1,4 +1,4 @@
-use crate::{relationships::CallEdge, syntax::HighlightedLine};
+use crate::{relationships::{CallEdge, SymbolRef}, syntax::HighlightedLine};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 pub const PLAIN: [f32; 3] = [0.79, 0.82, 0.86];
@@ -8,6 +8,7 @@ pub struct CallMark {
     pub start: usize,
     pub end: usize,
     pub target: String,
+    pub definition: SymbolRef,
 }
 
 #[derive(Default)]
@@ -22,12 +23,13 @@ impl CallHighlights {
             if edge.caller.file == edge.callee.file || edge.start_column >= edge.end_column
                 || !visible.contains(&edge.caller.file) || !visible.contains(&edge.callee.file) { continue; }
             result.files.entry(edge.caller.file.clone()).or_default().entry(edge.line).or_default().push(CallMark {
-                start: edge.start_column, end: edge.end_column, target: edge.callee.file.clone(),
+                start: edge.start_column, end: edge.end_column, target: edge.callee.file.clone(), definition: edge.callee.clone(),
             });
         }
         for lines in result.files.values_mut() {
             for marks in lines.values_mut() {
-                marks.sort_by(|a, b| (a.start, a.end, &a.target).cmp(&(b.start, b.end, &b.target)));
+                marks.sort_by(|a, b| (a.start, a.end, &a.target, &a.definition.name, &a.definition.file, a.definition.line)
+                    .cmp(&(b.start, b.end, &b.target, &b.definition.name, &b.definition.file, b.definition.line)));
                 marks.dedup();
             }
         }
@@ -46,6 +48,46 @@ impl CallHighlights {
         self.files.get(file).into_iter().flat_map(|lines| lines.iter())
             .flat_map(|(&line, marks)| marks.iter().map(move |mark| (line, mark))).collect()
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct LinkRange<'a> {
+    pub start: usize,
+    pub end: usize,
+    pub definition: &'a SymbolRef,
+}
+
+fn marked_columns(marks: &[CallMark], columns: usize) -> (Vec<Option<&CallMark>>, Vec<bool>) {
+    let mut result: Vec<Option<&CallMark>> = vec![None; columns];
+    let mut ambiguous = vec![false; columns];
+    for mark in marks {
+        for column in mark.start.min(columns)..mark.end.min(columns) {
+            if result[column].is_some_and(|previous| previous.definition != mark.definition) {
+                ambiguous[column] = true;
+            }
+            result[column] = Some(mark);
+        }
+    }
+    for (mark, &ambiguous) in result.iter_mut().zip(&ambiguous) {
+        if ambiguous { *mark = None; }
+    }
+    (result, ambiguous)
+}
+
+/// Columns count rendered Unicode scalar values and each end is exclusive.
+pub fn link_ranges(marks: &[CallMark], columns: usize) -> Vec<LinkRange<'_>> {
+    if marks.is_empty() { return Vec::new(); }
+    let (marked, _) = marked_columns(marks, columns);
+    let mut result: Vec<LinkRange<'_>> = Vec::new();
+    for (column, mark) in marked.into_iter().enumerate() {
+        let Some(mark) = mark else { continue };
+        if let Some(previous) = result.last_mut().filter(|previous| previous.end == column && *previous.definition == mark.definition) {
+            previous.end = column + 1;
+        } else {
+            result.push(LinkRange { start: column, end: column + 1, definition: &mark.definition });
+        }
+    }
+    result
 }
 
 pub fn file_rgb(path: &str, root: Option<&str>) -> [f32; 3] {
@@ -94,18 +136,10 @@ pub fn paint_line<'a>(line: &'a HighlightedLine, marks: &[CallMark], root: Optio
             column = end;
         }
     }
-    let mut targets: Vec<Option<&str>> = vec![None; length];
-    let mut ambiguous = vec![false; length];
-    for mark in marks {
-        if mark.end <= mark.start { continue; }
-        for column in mark.start.min(length)..mark.end.min(length) {
-            if targets[column].is_some_and(|target| target != mark.target) { ambiguous[column] = true; }
-            targets[column] = Some(&mark.target);
-        }
-    }
-    for column in 0..length {
-        if ambiguous[column] { colors[column] = PLAIN; }
-        else if let Some(target) = targets[column] { colors[column] = file_rgb(target, root); }
+    let (marked, ambiguous) = marked_columns(marks, length);
+    for (column, mark) in marked.into_iter().enumerate() {
+        if let Some(mark) = mark { colors[column] = file_rgb(&mark.target, root); }
+        else if ambiguous[column] { colors[column] = PLAIN; }
     }
     let mut runs = Vec::new();
     let mut start = 0;
@@ -121,12 +155,16 @@ pub fn paint_line<'a>(line: &'a HighlightedLine, marks: &[CallMark], root: Optio
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{relationships::SymbolRef, syntax::HighlightedText};
+    use crate::syntax::HighlightedText;
+
+    fn mark(start: usize, end: usize, file: &str, name: &str, line: usize) -> CallMark {
+        CallMark { start, end, target: file.into(), definition: SymbolRef { name: name.into(), file: file.into(), line } }
+    }
 
     #[test]
     fn neutral_text_only_colors_exact_cross_file_calls() {
         let text = HighlightedText::new("a.ts", "const result = run(); // run is a name here");
-        let mark = CallMark { start: 15, end: 18, target: "b.ts".into() };
+        let mark = mark(15, 18, "b.ts", "run", 4);
         let runs = paint_line(&text.lines[0], &[mark], Some("a.ts"), false, 100);
         assert_eq!(runs.iter().map(|run| run.text).collect::<String>(), text.lines[0].text);
         let colored: Vec<_> = runs.iter().filter(|run| run.color != PLAIN).collect();
@@ -138,7 +176,7 @@ mod tests {
     #[test]
     fn unicode_tabs_and_clipping_keep_the_original_display_text() {
         let text = HighlightedText::new("a.rb", "\té = B.run\r\n");
-        let marks = [CallMark { start: 10, end: 13, target: "b.rb".into() }];
+        let marks = [mark(10, 13, "b.rb", "run", 4)];
         for limit in 0..=20 {
             let runs = paint_line(&text.lines[0], &marks, None, false, limit);
             assert_eq!(runs.iter().map(|run| run.text).collect::<String>(), text.lines[0].text.chars().take(limit).collect::<String>());
@@ -160,7 +198,43 @@ mod tests {
         let text = HighlightedText::new("a.ts", "return run()");
         assert!(paint_line(&text.lines[0], &[], None, false, 100).iter().all(|run| run.color == PLAIN));
         assert!(paint_line(&text.lines[0], &[], None, true, 100).iter().any(|run| run.color != PLAIN));
-        let marks = [CallMark { start: 7, end: 10, target: "b.ts".into() }, CallMark { start: 7, end: 10, target: "c.ts".into() }];
+        let marks = [mark(7, 10, "b.ts", "run", 4), mark(7, 10, "c.ts", "run", 8)];
         assert!(paint_line(&text.lines[0], &marks, None, false, 100).iter().all(|run| run.color == PLAIN));
+    }
+
+    #[test]
+    fn distinct_definitions_in_one_file_never_choose_a_destination() {
+        let text = HighlightedText::new("a.ts", "return run()");
+        for alternate in [mark(7, 10, "b.ts", "run", 8), mark(7, 10, "b.ts", "other", 4)] {
+            let marks = [mark(7, 10, "b.ts", "run", 4), alternate];
+            assert!(link_ranges(&marks, 100).is_empty());
+            assert!(paint_line(&text.lines[0], &marks, None, true, 100).iter().any(|run| run.text == "run" && run.color == PLAIN));
+        }
+    }
+
+    #[test]
+    fn exact_duplicates_keep_one_definition_and_distinct_definitions_are_retained() {
+        let caller = SymbolRef { name: "caller".into(), file: "a.ts".into(), line: 1 };
+        let first = mark(0, 3, "b.ts", "run", 4);
+        let second = mark(0, 3, "b.ts", "run", 8);
+        let edge = |mark: &CallMark| CallEdge { caller: caller.clone(), callee: mark.definition.clone(), line: 2, start_column: mark.start, end_column: mark.end };
+        let visible = HashSet::from(["a.ts".into(), "b.ts".into()]);
+        let highlights = CallHighlights::new(&[edge(&first), edge(&second), edge(&first)], &visible);
+        assert_eq!(highlights.site_count(), 2);
+        assert!(link_ranges(highlights.line("a.ts", 2), 3).is_empty());
+        let marks = [first.clone(), first];
+        assert_eq!(link_ranges(&marks, 3), vec![LinkRange { start: 0, end: 3, definition: &marks[0].definition }]);
+    }
+
+    #[test]
+    fn links_clip_rendered_unicode_columns_and_exclude_overlap_and_boundaries() {
+        let text = HighlightedText::new("a.rb", "\té = B.run");
+        let marks = [mark(10, 13, "b.rb", "run", 4), mark(11, 12, "b.rb", "other", 8), mark(2, 2, "b.rb", "empty", 1), mark(8, 3, "b.rb", "backward", 1)];
+        let ranges = link_ranges(&marks, 12);
+        assert_eq!(ranges, vec![LinkRange { start: 10, end: 11, definition: &marks[0].definition }]);
+        assert_eq!(text.lines[0].text.chars().skip(ranges[0].start).take(ranges[0].end - ranges[0].start).collect::<String>(), "r");
+        assert!(link_ranges(&marks, 10).is_empty());
+        assert!(link_ranges(&marks, 0).is_empty());
+        assert_eq!(link_ranges(&marks, 13), vec![LinkRange { start: 10, end: 11, definition: &marks[0].definition }, LinkRange { start: 12, end: 13, definition: &marks[0].definition }]);
     }
 }

@@ -11,7 +11,7 @@ mod city;
 use crate::history::{self, History};
 use crate::call_colors::{self, CallHighlights, CallMark};
 use crate::filter::Filter;
-use crate::relationships::{supports_path, Direction, Graph, Reachability, SourceFile};
+use crate::relationships::{supports_path, Direction, Graph, Reachability, SourceFile, SymbolRef};
 use crate::syntax::HighlightedText;
 use crate::model::{code_inner, frame, ColorMode, Kind, Tree, CHAR_W, COL_CHARS, R};
 use crate::orbit::Orbit;
@@ -140,6 +140,11 @@ struct Label {
     dim: bool,
 }
 
+struct CallLink {
+    rect: Rect,
+    target: SymbolRef,
+}
+
 #[derive(Clone, Copy)]
 struct Drag {
     start: DVec2,
@@ -234,6 +239,12 @@ pub struct CodeMap {
     #[rust]
     selected: Option<usize>,
     #[rust]
+    definition_focus: Option<SymbolRef>,
+    #[rust]
+    call_links: Vec<CallLink>,
+    #[rust]
+    label_rects: Vec<Rect>,
+    #[rust]
     color_mode: ColorMode,
     #[rust]
     syntax_colors: bool,
@@ -298,6 +309,8 @@ impl CodeMap {
         self.tree = Tree::new(&name);
         self.root = root.clone();
         self.selected = None;
+        self.definition_focus = None;
+        self.call_links.clear();
         self.hover = None;
         self.history = None;
         self.graph = None;
@@ -445,6 +458,7 @@ impl CodeMap {
     }
 
     fn apply_selection(&mut self, cx: &mut Cx) {
+        self.definition_focus = None;
         self.tree.update_weights(self.show_ignored);
         self.tree.apply_filter(&self.filter, self.hide_tests, self.reachable.as_ref().map(|r| &r.paths));
         let visible = self.tree.nodes.iter().enumerate()
@@ -557,9 +571,41 @@ impl CodeMap {
     }
 
     fn select(&mut self, cx: &mut Cx, index: usize) {
+        if self.definition_focus.take().is_some() {
+            self.set_status(cx, self.summary());
+        }
         self.selected = Some(index);
         cx.widget_action(self.uid, CodeMapAction::Selected(self.info(index)));
         self.redraw(cx);
+    }
+
+    fn definition_line_rect(&self, index: usize, line: usize) -> Option<R> {
+        let node = self.tree.nodes.get(index)?;
+        if !self.tree.is_visible(index) { return None; }
+        node.code_line_rect(line)
+    }
+
+    fn jump_to_definition(&mut self, cx: &mut Cx, target: SymbolRef) {
+        if self.mode_3d { return; }
+        let Some(index) = self.tree.find(&target.file) else { return };
+        let Some(line) = self.definition_line_rect(index, target.line) else { return };
+        self.flight = None;
+        self.orbit_flight = None;
+        let source = self.tree.nodes[index].lines[target.line - 1];
+        self.flight = Some(definition_camera(line, source.indent as usize, source.len as usize, self.view.size));
+        self.frame = cx.new_next_frame();
+        self.definition_focus = Some(target.clone());
+        self.selected = Some(index);
+        self.ensure_text(cx, index);
+        cx.widget_action(self.uid, CodeMapAction::Selected(self.info(index)));
+        self.set_status(cx, format!("{} · Definition: {} at {}:{}", self.summary(), target.name, target.file, target.line));
+        self.redraw(cx);
+    }
+
+    fn call_at(&self, abs: DVec2) -> Option<SymbolRef> {
+        if !self.view.contains(abs) || self.label_rects.iter().any(|r| r.contains(abs)) { return None; }
+        if self.mode_3d { return None; }
+        self.call_links.iter().find(|link| link.rect.contains(abs)).map(|link| link.target.clone())
     }
 
     fn expand(&mut self, cx: &mut Cx, index: usize) {
@@ -810,6 +856,9 @@ impl CodeMap {
                 details.push_str("\n\nIncoming call sites are in the\ncaller files. Select one to see\nits colored calls to this file.");
             }
         }
+        if let Some(target) = self.definition_focus.as_ref().filter(|target| target.file == n.path) {
+            details.push_str(&format!("\n\nDefinition: {}\nLine {} (highlighted)", target.name, target.line));
+        }
         NodeInfo {
             title: n.name.clone(),
             path: if n.path.is_empty() { self.root.display().to_string() } else { n.path.clone() },
@@ -956,11 +1005,15 @@ impl CodeMap {
             for row in first_row..last_row {
                 let k = col * rows + row;
                 let Some(line) = node.lines.get(k) else { break };
-                let x = inner.pos.x + col as f64 * col_px;
-                let y = inner.pos.y + row as f64 * line_px;
+                let source_rect = node.code_line_rect(k + 1).unwrap();
+                let line_rect = self.to_screen(source_rect);
+                let (x, y) = (line_rect.pos.x, line_rect.pos.y);
+                if self.definition_focus.as_ref().is_some_and(|target| target.file == node.path && target.line == k + 1) {
+                    block(&mut self.draw_block, cx, line_rect, vec4(0.95, 0.73, 0.24, 0.12), vec4(0.95, 0.73, 0.24, 0.9), 1.5, 0.0);
+                }
                 if text_mode {
                     if let Some(line) = self.text_cache.get(&index).and_then(|text| text.lines.get(k)) {
-                        draw_source_line(&mut self.draw_code, cx, line, self.call_highlights.line(&node.path, k + 1), self.relationship_root.as_deref(), self.syntax_colors, dvec2(x, y), fade);
+                        self.call_links.extend(draw_source_line(&mut self.draw_code, cx, line, self.call_highlights.line(&node.path, k + 1), self.relationship_root.as_deref(), self.syntax_colors, dvec2(x, y), line_px, fade));
                     }
                 } else if line.len > 0 {
                     let color = if line.comment { comment_color } else { code_color };
@@ -1012,7 +1065,9 @@ impl CodeMap {
                 label.text.clone()
             };
             let w = (text.chars().count() as f64 * 5.6 + 8.0).min(room + 4.0);
-            block(&mut self.draw_block, cx, Rect { pos: pos - dvec2(3.0, 1.0), size: dvec2(w, 14.0) }, vec4(0.0, 0.0, 0.0, 0.72), vec4(0.0, 0.0, 0.0, 0.0), 0.0, 0.0);
+            let label_rect = Rect { pos: pos - dvec2(3.0, 1.0), size: dvec2(w, 14.0) };
+            self.label_rects.push(label_rect);
+            block(&mut self.draw_block, cx, label_rect, vec4(0.0, 0.0, 0.0, 0.72), vec4(0.0, 0.0, 0.0, 0.0), 0.0, 0.0);
             self.draw_label.color = if label.dim { vec4(0.75, 0.68, 0.55, 1.0) } else { vec4(0.92, 0.94, 0.96, 1.0) };
             self.draw_label.draw_abs(cx, pos, &text);
         }
@@ -1053,6 +1108,8 @@ impl CodeMap {
 
 impl Widget for CodeMap {
     fn draw_walk(&mut self, cx: &mut Cx2d, _scope: &mut Scope, walk: Walk) -> DrawStep {
+        self.call_links.clear();
+        self.label_rects.clear();
         // begin_turtle clips everything we draw to the widget's own rectangle
         cx.begin_turtle(walk, self.layout);
         let rect = cx.turtle().rect();
@@ -1115,6 +1172,7 @@ impl Widget for CodeMap {
         let hit = event.hits(cx, self.area);
         match &hit {
             Hit::FingerHoverIn(e) | Hit::FingerHoverOver(e) => {
+                cx.set_cursor(if self.call_at(e.abs).is_some() { MouseCursor::Hand } else { MouseCursor::Default });
                 let hover = self.hit(e.abs);
                 self.hover_abs = e.abs;
                 if hover != self.hover {
@@ -1123,6 +1181,7 @@ impl Widget for CodeMap {
                 }
             }
             Hit::FingerHoverOut(_) => {
+                cx.set_cursor(MouseCursor::Default);
                 if self.hover.take().is_some() {
                     self.redraw(cx);
                 }
@@ -1143,6 +1202,12 @@ impl Widget for CodeMap {
                 cx.set_cursor(MouseCursor::Default);
                 if let Some(drag) = self.drag.take() {
                     if !drag.moved {
+                        if !drag.pan {
+                            if let Some(target) = self.call_at(drag.start).filter(|target| self.call_at(e.abs).as_ref() == Some(target)) {
+                                self.jump_to_definition(cx, target);
+                                return;
+                            }
+                        }
                         if let Some(index) = self.hit(e.abs) {
                             self.select(cx, index);
                             if matches!(self.tree.nodes[index].kind, Kind::Ghost { .. }) {
@@ -1233,16 +1298,46 @@ fn short_label(text: &str, max: usize) -> String {
     else { text.chars().take(max.saturating_sub(1)).chain(['…']).collect() }
 }
 
-fn draw_source_line(draw: &mut DrawText, cx: &mut Cx2d, line: &crate::syntax::HighlightedLine, marks: &[CallMark], root: Option<&str>, syntax: bool, pos: DVec2, fade: f32) {
+fn draw_source_line(draw: &mut DrawText, cx: &mut Cx2d, line: &crate::syntax::HighlightedLine, marks: &[CallMark], root: Option<&str>, syntax: bool, pos: DVec2, line_height: f64, fade: f32) -> Vec<CallLink> {
+    let ranges = call_colors::link_ranges(marks, line.text.chars().count().min(COL_CHARS as usize));
+    let mut links = Vec::new();
     let mut x = pos.x;
+    let mut column = 0;
     for run in call_colors::paint_line(line, marks, root, syntax, COL_CHARS as usize) {
         let [r, g, b] = run.color;
         draw.color = vec4(r * fade, g * fade, b * fade, 1.0);
-        let width = draw.layout(cx.cx, 0.0, 0.0, None, false, Align::default(), run.text)
-            .rows.first().map_or(0.0, |row| row.width_in_lpxs as f64);
+        let width = source_text_width(draw, cx.cx, run.text);
+        let end = column + run.text.chars().count();
+        for range in &ranges {
+            let (start, stop) = (range.start.max(column), range.end.min(end));
+            if stop <= start { continue; }
+            let prefix = run.text.char_indices().nth(start - column).map_or(run.text.len(), |(i, _)| i);
+            let suffix = run.text.char_indices().nth(stop - column).map_or(run.text.len(), |(i, _)| i);
+            let left = source_text_width(draw, cx.cx, &run.text[..prefix]);
+            let right = source_text_width(draw, cx.cx, &run.text[..suffix]);
+            links.push(CallLink {
+                rect: Rect { pos: dvec2(x + left, pos.y), size: dvec2(right - left, line_height) },
+                target: range.definition.clone(),
+            });
+        }
         draw.draw_abs(cx, dvec2(x, pos.y), run.text);
         x += width;
+        column = end;
     }
+    links
+}
+
+fn definition_camera(line: R, indent: usize, length: usize, view: DVec2) -> (DVec2, f64) {
+    let scale = (view.x / line.w * 0.9).max(18.0 / line.h);
+    let start = line.x + indent.min(COL_CHARS as usize) as f64 * CHAR_W * line.h;
+    let width = length.max(1).min((COL_CHARS as usize).saturating_sub(indent)) as f64 * CHAR_W * line.h;
+    (dvec2(start + width.min(view.x / scale * 0.8) * 0.5, line.y + line.h * 0.5), scale)
+}
+
+fn source_text_width(draw: &DrawText, cx: &mut Cx, text: &str) -> f64 {
+    if text.is_empty() { return 0.0; }
+    draw.layout(cx, 0.0, 0.0, None, false, Align::default(), text)
+        .rows.first().map_or(0.0, |row| row.width_in_lpxs as f64)
 }
 
 fn draw_call_strips(draw: &mut DrawBlock, cx: &mut Cx2d, marks: &[CallMark], root: Option<&str>, pos: DVec2, char_width: f64, line_height: f64, fade: f32) -> usize {
@@ -1345,5 +1440,25 @@ fn fmt_age(secs: i64) -> String {
         d if d < 60 => format!("{d} days ago"),
         d if d < 730 => format!("{} months ago", d / 30),
         d => format!("{} years ago", d / 365),
+    }
+}
+
+#[cfg(test)]
+mod navigation_tests {
+    use super::*;
+
+    #[test]
+    fn definition_flights_keep_the_declaration_visible_in_narrow_maps() {
+        let line = R { x: 150.0, y: 290.0, w: 100.0, h: 2.0 };
+        for width in [320.0, 600.0, 1060.0] {
+            for indent in [0, 4, 24] {
+                let (center, scale) = definition_camera(line, indent, 18, dvec2(width, 700.0));
+                let declaration_start = line.x + indent as f64 * CHAR_W * line.h;
+                let left = (declaration_start - center.x) * scale + width * 0.5;
+                assert!(left >= 0.0 && left < width);
+                assert!(line.h * scale >= 18.0);
+                assert_eq!(center.y, line.y + line.h * 0.5);
+            }
+        }
     }
 }

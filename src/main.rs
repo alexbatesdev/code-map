@@ -92,7 +92,7 @@ script_mod! {
                             labels: ["1" "2" "3" "5" "8"]
                         }
                         relationship_root := InfoLabel{width: Fill text: "Select a source file to trace its calls"}
-                        InfoLabel{text: "Call text and destination file share a color"}
+                        InfoLabel{text: "Call colors match files · Click a call to jump (2D)"}
                     }
                     View{
                         width: Fill height: Fill

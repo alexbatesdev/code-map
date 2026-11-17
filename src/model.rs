@@ -112,6 +112,19 @@ impl Node {
     pub fn is_file(&self) -> bool {
         matches!(self.kind, Kind::Text | Kind::Binary)
     }
+
+    pub fn code_line_rect(&self, line: usize) -> Option<R> {
+        let index = line.checked_sub(1).filter(|&i| i < self.lines.len())?;
+        if self.kind != Kind::Text || self.line_h <= 0.0 { return None; }
+        let rows = self.lines.len().div_ceil(self.cols.max(1) as usize);
+        let inner = code_inner(self.rect);
+        Some(R {
+            x: inner.x + (index / rows) as f64 * COL_CHARS * CHAR_W * self.line_h,
+            y: inner.y + (index % rows) as f64 * self.line_h,
+            w: COL_CHARS * CHAR_W * self.line_h,
+            h: self.line_h,
+        })
+    }
 }
 
 impl Default for Tree {
@@ -551,6 +564,25 @@ mod tests {
 
     fn file(path: &str, lines: usize, ignored: bool) -> Entry {
         Entry { path: path.into(), kind: EntryKind::Text { bytes: lines as u64 * 10, lines: vec![Line::default(); lines] }, ignored }
+    }
+
+    #[test]
+    fn definition_lines_follow_source_columns_and_reject_missing_lines() {
+        let mut tree = Tree::new("project");
+        tree.insert(file("many.rb", 3108, false));
+        tree.update_weights(false);
+        tree.layout(R { x: 0.0, y: 0.0, w: 1000.0, h: 700.0 });
+        let node = &tree.nodes[tree.find("many.rb").unwrap()];
+        let first = node.code_line_rect(1).unwrap();
+        let rows = node.lines.len().div_ceil(node.cols as usize);
+        assert!(node.cols > 1);
+        let next_column = node.code_line_rect(rows + 1).unwrap();
+        assert_eq!(first.y, next_column.y);
+        assert!((next_column.x - first.x - first.w).abs() < 1e-8);
+        assert!(node.code_line_rect(3104).is_some());
+        assert!(node.code_line_rect(0).is_none());
+        assert!(node.code_line_rect(3109).is_none());
+        assert!(tree.nodes[0].code_line_rect(1).is_none());
     }
 
     #[test]

@@ -21,6 +21,10 @@ original map. The normal file map stays available in both 2D and 3D.
   back into language colors while retaining call colors.
   Select a connected file for the method names and call-site lines that explain
   its connection. Select **All files** to leave the relationship view.
+- **Jump to definition (2D):** at readable source zoom, click a colored call name
+  to fly to the resolved declaration. Its line is highlighted and the inspector
+  shows the method and line number. The trace root, filters and depth stay put.
+  Only resolved colored calls are links; dynamic or ambiguous calls remain plain.
 - **Source colors:** the trace view highlights exact resolved method-call names
   at readable zoom. The inspector lists their source lines and columns. Incoming
   call sites are in the caller files; select one to see its calls into the root.
