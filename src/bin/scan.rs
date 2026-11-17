@@ -13,6 +13,9 @@ mod history;
 #[path = "../model.rs"]
 mod model;
 #[allow(dead_code)]
+#[path = "../filter.rs"]
+mod filter;
+#[allow(dead_code)]
 #[path = "../scan.rs"]
 mod scan;
 

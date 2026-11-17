@@ -232,7 +232,7 @@ impl CodeMap {
             }
             let text_mode = panel.line_px >= TEXT_FROM_PX as f32 && text_budget > 0;
             if text_mode {
-                self.ensure_text(panel.index);
+                self.ensure_text(cx.cx, panel.index);
             }
             let node = &self.tree.nodes[panel.index];
             // Choose local units so one line is about as many units as it has
@@ -261,7 +261,6 @@ impl CodeMap {
             let col_w = COL_CHARS * char_w;
             let base = self.file_color(panel.index);
             let code_color = mix_rgb(base, vec4(1.0, 1.0, 1.0, 1.0), 0.35);
-            let text_color = mix_rgb(base, vec4(1.0, 1.0, 1.0, 1.0), 0.8);
             let comment_color = vec4(0.35, 0.48, 0.35, 1.0);
             if text_mode {
                 self.draw_code.text_style.font_size = (local_line * 0.6) as f32;
@@ -278,11 +277,9 @@ impl CodeMap {
                     if text_budget == 0 {
                         break;
                     }
-                    if let Some(text) = self.text_cache.get(&panel.index).and_then(|t| t.get(i)) {
-                        if !text.trim().is_empty() {
-                            let clipped: String = text.chars().take(COL_CHARS as usize).collect();
-                            self.draw_code.color = if line.comment { comment_color } else { text_color };
-                            self.draw_code.draw_abs(cx2d, dvec2(x, y), &clipped);
+                    if let Some(line) = self.text_cache.get(&panel.index).and_then(|text| text.lines.get(i)) {
+                        if !line.text.trim().is_empty() {
+                            draw_highlighted_line(&mut self.draw_code, cx2d, line, dvec2(x, y), 1.0);
                             text_budget -= 1;
                         }
                     }

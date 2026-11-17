@@ -6,6 +6,9 @@
 pub use makepad_widgets;
 
 mod history;
+mod filter;
+mod relationships;
+mod syntax;
 mod map_view;
 mod model;
 mod orbit;
@@ -42,6 +45,7 @@ script_mod! {
                         show_bg: true
                         draw_bg +: {color: #x12161c}
                         title := Label{
+                            width: Fill
                             text: "Code Map"
                             draw_text +: {color: #xffffff text_style +: {font_size: 10.0}}
                         }
@@ -56,18 +60,44 @@ script_mod! {
                         three_d := CheckBox{text: "3D" active: false}
                         fit_button := Button{text: "Fit"}
                         show_ignored := CheckBox{text: "Show ignored" active: true}
-                        status := Label{
-                            width: Fill
-                            text: ""
-                            draw_text +: {color: #x8a949e text_style +: {font_size: 9.0}}
+                    }
+                    filters := View{
+                        width: Fill height: 38
+                        flow: Right spacing: 12
+                        padding: Inset{left: 12, right: 12}
+                        align: Align{y: 0.5}
+                        Label{text: "Filter"}
+                        filter_query := TextInput{
+                            width: 420 height: 28
+                            empty_text: "app/ | webpack/ -**/*.spec.ts"
                         }
+                        hide_tests := CheckBox{text: "Hide specs / tests" active: false}
+                        InfoLabel{width: Fill text: "Spaces: AND   |: OR   -term: exclude   *: wildcard"}
+                    }
+                    relationships := View{
+                        width: Fill height: 38
+                        flow: Right spacing: 12
+                        padding: Inset{left: 12, right: 12}
+                        align: Align{y: 0.5}
+                        relationship_mode := DropDown{
+                            width: 175
+                            labels: ["All files" "Calls from root" "Callers of root"]
+                        }
+                        trace_selected := Button{text: "Trace selected file"}
+                        Label{text: "Depth"}
+                        relationship_depth := DropDown{
+                            width: 80
+                            labels: ["1" "2" "3" "5" "8"]
+                        }
+                        relationship_root := InfoLabel{width: Fill text: "Select a source file to trace its calls"}
+                        InfoLabel{text: "Root: gold   Direct: cyan   Indirect: purple"}
                     }
                     View{
                         width: Fill height: Fill
                         flow: Right
                         map := CodeMap{}
                         inspector := View{
-                            width: 290 height: Fill
+                            width: 340 height: Fill
                             flow: Down spacing: 8
                             padding: Inset{left: 14, right: 14, top: 14, bottom: 14}
                             show_bg: true
@@ -82,12 +112,20 @@ script_mod! {
                                 draw_text +: {color: #xffffff text_style +: {font_size: 11.0}}
                             }
                             info_path := InfoLabel{text: ""}
-                            info_details := InfoLabel{text: ""}
-                            View{width: Fill height: Fill}
+                            ScrollYView{
+                                width: Fill height: Fill
+                                info_details := InfoLabel{text: ""}
+                            }
                             InfoLabel{
                                 text: "Scroll: zoom\nDrag: pan (2D) or orbit (3D)\nShift or right drag: pan (3D)\nClick: inspect\nDouble click: fly to it\nEnter in search: next match\nStriped boxes are ignored by git.\nClick one to read it."
                             }
                         }
+                    }
+                    status := Label{
+                        width: Fill height: 26
+                        text: ""
+                        padding: Inset{left: 12, right: 12, top: 6}
+                        draw_text +: {color: #x8a949e text_style +: {font_size: 9.0}}
                     }
                 }
             }
@@ -128,6 +166,21 @@ impl MatchEvent for App {
         if let Some(show) = self.ui.check_box(cx, ids!(show_ignored)).changed(actions) {
             map.set_show_ignored(cx, show);
         }
+        if let Some(query) = self.ui.text_input(cx, ids!(filter_query)).changed(actions) {
+            map.set_filter(cx, &query);
+        }
+        if let Some(hide) = self.ui.check_box(cx, ids!(hide_tests)).changed(actions) {
+            map.set_hide_tests(cx, hide);
+        }
+        if let Some(mode) = self.ui.drop_down(cx, ids!(relationship_mode)).changed(actions) {
+            map.set_relationship_mode(cx, mode);
+        }
+        if let Some(depth) = self.ui.drop_down(cx, ids!(relationship_depth)).changed(actions) {
+            map.set_relationship_depth(cx, [1, 2, 3, 5, 8][depth.min(4)]);
+        }
+        if self.ui.button(cx, ids!(trace_selected)).clicked(actions) {
+            map.trace_selected(cx);
+        }
         if let Some(on) = self.ui.check_box(cx, ids!(three_d)).changed(actions) {
             map.set_3d(cx, on);
         }
@@ -159,6 +212,10 @@ impl MatchEvent for App {
             }
             match wa.cast::<CodeMapAction>() {
                 CodeMapAction::Status(text) => self.ui.label(cx, ids!(status)).set_text(cx, &text),
+                CodeMapAction::Root(text, mode) => {
+                    self.ui.label(cx, ids!(relationship_root)).set_text(cx, &text);
+                    self.ui.drop_down(cx, ids!(relationship_mode)).set_selected_item(cx, mode);
+                }
                 CodeMapAction::Selected(info) => {
                     self.ui.label(cx, ids!(info_title)).set_text(cx, &info.title);
                     self.ui.label(cx, ids!(info_path)).set_text(cx, &info.path);

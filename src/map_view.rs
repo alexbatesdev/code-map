@@ -9,14 +9,17 @@
 mod city;
 
 use crate::history::{self, History};
+use crate::filter::Filter;
+use crate::relationships::{supports_path, Direction, Graph, Reachability, SourceFile};
+use crate::syntax::HighlightedText;
 use crate::model::{code_inner, frame, ColorMode, Kind, Tree, CHAR_W, COL_CHARS, R};
 use crate::orbit::Orbit;
 use crate::scan::{self, Entry};
 use makepad_widgets::*;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet, VecDeque},
     path::PathBuf,
-    sync::mpsc::{channel, Receiver, Sender},
+    sync::mpsc::{channel, sync_channel, Receiver, Sender, SyncSender},
     time::Instant,
 };
 
@@ -119,12 +122,15 @@ pub enum CodeMapAction {
     None,
     Selected(NodeInfo),
     Status(String),
+    Root(String, usize),
 }
 
 enum ScanMsg {
     Project(Result<scan::ProjectScan, String>, f64),
     Expanded(String, Vec<Entry>),
     History(Result<History, String>),
+    Graph(Graph, usize),
+    Text(usize, HighlightedText),
 }
 
 struct Label {
@@ -233,6 +239,26 @@ pub struct CodeMap {
     #[rust]
     search: String,
     #[rust]
+    filter: Filter,
+    #[rust]
+    filter_error: Option<String>,
+    #[rust]
+    hide_tests: bool,
+    #[rust]
+    relationship_mode: usize,
+    #[rust(1)]
+    relationship_depth: usize,
+    #[rust]
+    relationship_root: Option<String>,
+    #[rust]
+    graph: Option<Graph>,
+    #[rust]
+    graph_loading: bool,
+    #[rust]
+    graph_read_errors: usize,
+    #[rust]
+    reachable: Option<Reachability>,
+    #[rust]
     matches: Vec<usize>,
     #[rust]
     match_cursor: usize,
@@ -246,7 +272,15 @@ pub struct CodeMap {
     frame: NextFrame,
     /// File contents for the fully zoomed-in view, loaded on demand.
     #[rust]
-    text_cache: HashMap<usize, Vec<String>>,
+    text_cache: HashMap<usize, HighlightedText>,
+    #[rust]
+    text_worker: Option<SyncSender<(usize, PathBuf, String)>>,
+    #[rust]
+    text_pending: HashSet<usize>,
+    #[rust]
+    text_order: VecDeque<usize>,
+    #[rust]
+    text_bytes: usize,
     #[rust]
     message: String,
     #[rust]
@@ -261,9 +295,25 @@ impl CodeMap {
         self.selected = None;
         self.hover = None;
         self.history = None;
+        self.graph = None;
+        self.graph_loading = false;
+        self.relationship_root = None;
+        self.reachable = None;
         self.text_cache.clear();
+        self.text_pending.clear();
+        self.text_order.clear();
+        self.text_bytes = 0;
         let (tx, rx) = channel();
         let worker_tx = tx.clone();
+        let (text_tx, text_rx) = sync_channel::<(usize, PathBuf, String)>(8);
+        let result_tx = tx.clone();
+        std::thread::spawn(move || {
+            while let Ok((index, path, relative)) = text_rx.recv() {
+                let bytes = std::fs::read(path).unwrap_or_default();
+                if result_tx.send(ScanMsg::Text(index, HighlightedText::from_bytes(&relative, &bytes))).is_err() { break; }
+            }
+        });
+        self.text_worker = Some(text_tx);
         self.tx = Some(tx);
         self.rx = Some(rx);
         self.pending = 1;
@@ -286,7 +336,121 @@ impl CodeMap {
 
     pub fn set_show_ignored(&mut self, cx: &mut Cx, show: bool) {
         self.show_ignored = show;
+        self.apply_selection(cx);
+    }
+
+    pub fn set_filter(&mut self, cx: &mut Cx, query: &str) {
+        match Filter::parse(query) {
+            Ok(filter) => {
+                self.filter = filter;
+                self.filter_error = None;
+                self.apply_selection(cx);
+            }
+            Err(error) => {
+                self.filter_error = Some(error.clone());
+                self.set_status(cx, format!("Filter error: {error}. Showing the last valid filter."));
+            }
+        }
+    }
+
+    pub fn set_hide_tests(&mut self, cx: &mut Cx, hide: bool) {
+        self.hide_tests = hide;
+        self.apply_selection(cx);
+    }
+
+    pub fn set_relationship_mode(&mut self, cx: &mut Cx, mode: usize) {
+        self.relationship_mode = mode.min(2);
+        if mode > 0 && self.relationship_root.is_none() {
+            self.trace_selected_in(cx, self.relationship_mode);
+        } else {
+            self.refresh_relationships(cx);
+        }
+    }
+
+    pub fn set_relationship_depth(&mut self, cx: &mut Cx, depth: usize) {
+        self.relationship_depth = depth.clamp(1, 8);
+        self.refresh_relationships(cx);
+    }
+
+    pub fn trace_selected(&mut self, cx: &mut Cx) {
+        self.trace_selected_in(cx, 1);
+    }
+
+    fn trace_selected_in(&mut self, cx: &mut Cx, mode: usize) {
+        let Some(index) = self.selected.filter(|&i| self.tree.nodes[i].kind == Kind::Text) else {
+            self.set_status(cx, "Select a Ruby, JavaScript or TypeScript file, then Trace selected file.".into());
+            return;
+        };
+        let path = self.tree.nodes[index].path.clone();
+        if !supports_path(&path) {
+            self.set_status(cx, "Call analysis supports Ruby, JavaScript and TypeScript source files.".into());
+            return;
+        }
+        if self.tree.nodes[index].ignored {
+            self.set_status(cx, "Ignored files are outside the call index. Select a non-ignored source file.".into());
+            return;
+        }
+        self.relationship_root = Some(path.clone());
+        self.relationship_mode = mode;
+        cx.widget_action(self.uid, CodeMapAction::Root(path, mode));
+        if self.graph.is_none() && !self.graph_loading {
+            self.start_graph(cx);
+        }
+        self.refresh_relationships(cx);
+    }
+
+    fn start_graph(&mut self, cx: &mut Cx) {
+        let Some(tx) = self.tx.clone() else { return };
+        let paths: Vec<String> = self.tree.nodes.iter()
+            .filter(|node| node.kind == Kind::Text && !node.ignored && supports_path(&node.path))
+            .map(|node| node.path.clone()).collect();
+        let root = self.root.clone();
+        self.graph_loading = true;
+        self.pending += 1;
+        std::thread::spawn(move || {
+            let mut read_errors = 0;
+            let sources: Vec<SourceFile> = paths.into_iter().filter_map(|path| {
+                match std::fs::read_to_string(root.join(&path)) {
+                    Ok(text) => Some(SourceFile { path, text }),
+                    Err(_) => { read_errors += 1; None }
+                }
+            }).collect();
+            let base_url = std::fs::read_to_string(root.join("tsconfig.json")).ok()
+                .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+                .and_then(|value| value.pointer("/compilerOptions/baseUrl").and_then(|v| v.as_str()).map(str::to_owned));
+            let graph = Graph::build(&sources, base_url.as_deref());
+            let _ = tx.send(ScanMsg::Graph(graph, read_errors));
+        });
+        self.frame = cx.new_next_frame();
+    }
+
+    fn refresh_relationships(&mut self, cx: &mut Cx) {
+        self.reachable = if self.relationship_mode > 0 {
+            self.graph.as_ref().zip(self.relationship_root.as_deref()).map(|(graph, root)| {
+                graph.related(root, if self.relationship_mode == 2 { Direction::Callers } else { Direction::Callees }, self.relationship_depth)
+            })
+        } else { None };
+        self.apply_selection(cx);
+    }
+
+    fn apply_selection(&mut self, cx: &mut Cx) {
+        self.tree.update_weights(self.show_ignored);
+        self.tree.apply_filter(&self.filter, self.hide_tests, self.reachable.as_ref().map(|r| &r.paths));
+        self.matches = self.tree.search(&self.search);
+        self.match_cursor = 0;
+        self.hover = None;
         self.needs_layout = true;
+        self.flight = None;
+        self.orbit_flight = None;
+        self.needs_fit = true;
+        if self.mode_3d { self.fit(cx); }
+        if let Some(index) = self.selected.filter(|&i| self.tree.is_visible(i)) {
+            cx.widget_action(self.uid, CodeMapAction::Selected(self.info(index)));
+        } else if self.selected.is_some() {
+            self.selected = None;
+            cx.widget_action(self.uid, CodeMapAction::Selected(NodeInfo::default()));
+        }
+        self.set_status(cx, self.summary());
         self.redraw(cx);
     }
 
@@ -404,6 +568,21 @@ impl CodeMap {
         if let Some(h) = &self.history {
             text.push_str(&format!(", {} commits of history", fmt_num(h.commits_read as u64)));
         }
+        if let Some(error) = &self.filter_error {
+            return format!("Filter error: {error}. Showing the last valid filter.");
+        }
+        if self.graph_loading { text.push_str(" · Indexing calls…"); }
+        if self.relationship_mode > 0 {
+            if let Some(reachable) = &self.reachable {
+                let visible = |path: &&String| self.tree.find(path).is_some_and(|index| self.tree.is_visible(index));
+                text.push_str(&format!(" · {} direct / {} indirect files · static calls, depth {}",
+                    reachable.direct.iter().filter(visible).count(), reachable.indirect.iter().filter(visible).count(), self.relationship_depth));
+            }
+            if let Some(graph) = &self.graph {
+                text.push_str(&format!(" · {} unresolved sites / {} parse errors / {} unread files",
+                    graph.unresolved_sites, graph.parse_errors, self.graph_read_errors));
+            }
+        }
         text
     }
 
@@ -420,6 +599,7 @@ impl CodeMap {
                         self.tree.insert(entry);
                     }
                     self.tree.update_weights(true);
+                    self.tree.apply_filter(&self.filter, self.hide_tests, None);
                     let text = format!(
                         "{}, scanned in {:.2}s ({})",
                         self.summary(),
@@ -460,6 +640,24 @@ impl CodeMap {
                 }
                 ScanMsg::History(Err(err)) => {
                     self.set_status(cx, format!("No git history: {err}"));
+                }
+                ScanMsg::Graph(graph, read_errors) => {
+                    self.graph = Some(graph);
+                    self.graph_loading = false;
+                    self.graph_read_errors = read_errors;
+                    self.refresh_relationships(cx);
+                }
+                ScanMsg::Text(index, text) => {
+                    self.text_pending.remove(&index);
+                    self.text_bytes += text.lines.iter().map(|line| line.text.len()).sum::<usize>();
+                    self.text_cache.insert(index, text);
+                    self.text_order.push_back(index);
+                    while self.text_cache.len() > 64 || (self.text_bytes > 32 * 1024 * 1024 && self.text_cache.len() > 1) {
+                        let Some(oldest) = self.text_order.pop_front() else { break };
+                        if let Some(old) = self.text_cache.remove(&oldest) {
+                            self.text_bytes = self.text_bytes.saturating_sub(old.lines.iter().map(|line| line.text.len()).sum::<usize>());
+                        }
+                    }
                 }
             }
             self.redraw(cx);
@@ -573,6 +771,19 @@ impl CodeMap {
         if n.ignored && !matches!(n.kind, Kind::Ghost { .. }) {
             details.push_str("\n\nMatched by .gitignore");
         }
+        if self.relationship_mode > 0 && n.is_file() {
+            if self.relationship_root.as_deref() == Some(n.path.as_str()) {
+                details.push_str("\n\nCall root: all methods in this file.");
+            } else if let Some(chain) = self.reachable.as_ref().and_then(|r| r.witnesses.get(&n.path)) {
+                details.push_str(if chain.len() == 1 { "\n\nDirect static call" } else { "\n\nIndirect static call path" });
+                for edge in chain {
+                    details.push_str(&format!("\n\n{}\n{}:{}\n  calls {}\n{}:{}",
+                        short_label(&edge.caller.name, 40), short_label(&edge.caller.file, 42), edge.line,
+                        short_label(&edge.callee.name, 38), short_label(&edge.callee.file, 42), edge.callee.line));
+                }
+                details.push_str("\n\nStatic resolution; execution depends\non runtime inputs and dispatch.");
+            }
+        }
         NodeInfo {
             title: n.name.clone(),
             path: if n.path.is_empty() { self.root.display().to_string() } else { n.path.clone() },
@@ -587,6 +798,11 @@ impl CodeMap {
     /// Base color of a file for the current color mode.
     fn file_color(&self, index: usize) -> Vec4f {
         let node = &self.tree.nodes[index];
+        if let Some(reachable) = &self.reachable {
+            if self.relationship_root.as_deref() == Some(node.path.as_str()) { return vec4(0.95, 0.73, 0.24, 1.0); }
+            if reachable.direct.contains(&node.path) { return vec4(0.2, 0.8, 0.95, 1.0); }
+            if reachable.indirect.contains(&node.path) { return vec4(0.7, 0.45, 0.95, 1.0); }
+        }
         match self.color_mode {
             ColorMode::FileType => match node.kind {
                 Kind::Binary => vec4(0.45, 0.45, 0.47, 1.0),
@@ -697,11 +913,10 @@ impl CodeMap {
         let view = self.view;
         let text_mode = line_px >= TEXT_FROM_PX;
         if text_mode {
-            self.ensure_text(index);
+            self.ensure_text(cx.cx, index);
         }
         let node = &self.tree.nodes[index];
         let code_color = scale_rgb(mix_rgb(base, vec4(1.0, 1.0, 1.0, 1.0), 0.35), 0.85 * fade);
-        let text_color = scale_rgb(mix_rgb(base, vec4(1.0, 1.0, 1.0, 1.0), 0.75), fade);
         let comment_color = vec4(0.30 * fade, 0.40 * fade, 0.30 * fade, 1.0);
         let mut drawn = 0;
         // only visit the columns and rows that are actually on screen
@@ -719,10 +934,8 @@ impl CodeMap {
                 let x = inner.pos.x + col as f64 * col_px;
                 let y = inner.pos.y + row as f64 * line_px;
                 if text_mode {
-                    if let Some(text) = self.text_cache.get(&index).and_then(|t| t.get(k)) {
-                        let clipped: String = text.chars().take(COL_CHARS as usize).collect();
-                        self.draw_code.color = if line.comment { scale_rgb(vec4(0.5, 0.65, 0.5, 1.0), fade) } else { text_color };
-                        self.draw_code.draw_abs(cx, dvec2(x, y), &clipped);
+                    if let Some(line) = self.text_cache.get(&index).and_then(|text| text.lines.get(k)) {
+                        draw_highlighted_line(&mut self.draw_code, cx, line, dvec2(x, y), fade);
                     }
                 } else if line.len > 0 {
                     let color = if line.comment { comment_color } else { code_color };
@@ -743,16 +956,14 @@ impl CodeMap {
     }
 
     /// Load a file's text for the fully zoomed-in view (cached).
-    fn ensure_text(&mut self, index: usize) {
-        if self.text_cache.contains_key(&index) {
-            return;
+    fn ensure_text(&mut self, cx: &mut Cx, index: usize) {
+        if self.text_cache.contains_key(&index) || self.text_pending.contains(&index) { return; }
+        let relative = self.tree.nodes[index].path.clone();
+        if self.text_worker.as_ref().is_some_and(|tx| tx.try_send((index, self.root.join(&relative), relative)).is_ok()) {
+            self.text_pending.insert(index);
+            self.pending += 1;
+            self.frame = cx.new_next_frame();
         }
-        if self.text_cache.len() > 300 {
-            self.text_cache.clear();
-        }
-        let content = std::fs::read(self.root.join(&self.tree.nodes[index].path)).unwrap_or_default();
-        let text = String::from_utf8_lossy(&content).into_owned();
-        self.text_cache.insert(index, text.lines().map(|l| l.replace('\t', "    ")).collect());
     }
 
     fn outline(&mut self, cx: &mut Cx2d, index: usize, color: Vec4f, width: f32) {
@@ -832,6 +1043,12 @@ impl Widget for CodeMap {
         if self.needs_layout {
             self.relayout();
         }
+        if self.tree.nodes[0].weight <= 0.0 {
+            self.draw_label.color = vec4(0.7, 0.7, 0.7, 1.0);
+            self.draw_label.draw_abs(cx, rect.pos + dvec2(16.0, 16.0), "No files match this selection. Clear the filter or choose All files.");
+            cx.end_turtle_with_area(&mut self.area);
+            return DrawStep::done();
+        }
         if self.needs_fit && rect.size.x > 0.0 {
             self.cam_scale = (rect.size.x / self.world.w).min(rect.size.y / self.world.h);
             let half = rect.size * 0.5;
@@ -845,12 +1062,12 @@ impl Widget for CodeMap {
         } else {
             self.draw_map(cx);
             if let Some(h) = self.hover {
-                if h < self.tree.nodes.len() {
+                if self.tree.is_visible(h) {
                     self.outline(cx, h, vec4(1.0, 1.0, 1.0, 0.5), 1.5);
                 }
             }
             if let Some(s) = self.selected {
-                if s < self.tree.nodes.len() {
+                if self.tree.is_visible(s) {
                     self.outline(cx, s, vec4(0.35, 0.85, 1.0, 1.0), 2.5);
                 }
             }
@@ -927,6 +1144,21 @@ impl Widget for CodeMap {
 // `CodeMapRef` is generated by `#[derive(Widget)]`: a handle the app uses to
 // reach this widget from outside.
 impl CodeMapRef {
+    pub fn set_filter(&self, cx: &mut Cx, query: &str) {
+        if let Some(mut inner) = self.borrow_mut() { inner.set_filter(cx, query); }
+    }
+    pub fn set_hide_tests(&self, cx: &mut Cx, hide: bool) {
+        if let Some(mut inner) = self.borrow_mut() { inner.set_hide_tests(cx, hide); }
+    }
+    pub fn set_relationship_mode(&self, cx: &mut Cx, mode: usize) {
+        if let Some(mut inner) = self.borrow_mut() { inner.set_relationship_mode(cx, mode); }
+    }
+    pub fn set_relationship_depth(&self, cx: &mut Cx, depth: usize) {
+        if let Some(mut inner) = self.borrow_mut() { inner.set_relationship_depth(cx, depth); }
+    }
+    pub fn trace_selected(&self, cx: &mut Cx) {
+        if let Some(mut inner) = self.borrow_mut() { inner.trace_selected(cx); }
+    }
     pub fn open(&self, cx: &mut Cx, root: PathBuf) {
         if let Some(mut inner) = self.borrow_mut() {
             inner.open(cx, root);
@@ -961,6 +1193,23 @@ impl CodeMapRef {
         if let Some(mut inner) = self.borrow_mut() {
             inner.set_3d(cx, on);
         }
+    }
+}
+
+fn short_label(text: &str, max: usize) -> String {
+    if text.chars().count() <= max { text.to_owned() }
+    else { text.chars().take(max.saturating_sub(1)).chain(['…']).collect() }
+}
+
+fn draw_highlighted_line(draw: &mut DrawText, cx: &mut Cx2d, line: &crate::syntax::HighlightedLine, pos: DVec2, fade: f32) {
+    let mut x = pos.x;
+    for run in line.clipped_spans(COL_CHARS as usize) {
+        let [r, g, b] = run.category.rgb();
+        draw.color = vec4(r * fade, g * fade, b * fade, 1.0);
+        let width = draw.layout(cx.cx, 0.0, 0.0, None, false, Align::default(), run.text)
+            .rows.first().map_or(0.0, |row| row.width_in_lpxs as f64);
+        draw.draw_abs(cx, dvec2(x, pos.y), run.text);
+        x += width;
     }
 }
 
