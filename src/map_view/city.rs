@@ -112,7 +112,7 @@ impl CodeMap {
     fn draw_city(&mut self, cx: &mut Cx3d, frame: &Frame, label_spots: &mut Vec<(f32, usize, Vec3f)>) {
         let k = self.scale_3d();
         let (ox, oz) = (self.world.w as f32 * 0.5, self.world.h as f32 * 0.5);
-        let searching = self.search_active();
+        let searching = self.search_active() && self.reachable.is_none();
         let mut panels: Vec<CodePanel> = Vec::new();
         self.picks.clear();
         self.draw_cube.transform = Mat4f::identity();
@@ -171,17 +171,20 @@ impl CodeMap {
             if node.ignored {
                 color = scale_rgb(color, 0.6);
             }
-            if searching {
+            if searching && self.reachable.is_none() {
                 if !node.on_path {
                     color = scale_rgb(color, 0.15);
                 } else if node.lit && !is_dir {
                     color = mix_rgb(color, vec4(1.0, 0.9, 0.3, 1.0), 0.5);
                 }
             }
-            if self.selected == Some(index) {
+            if self.selected == Some(index) && self.reachable.is_none() {
                 color = mix_rgb(color, vec4(0.35, 0.85, 1.0, 1.0), 0.6);
-            } else if self.hover == Some(index) {
+            } else if self.hover == Some(index) && self.reachable.is_none() {
                 color = mix_rgb(color, vec4(1.0, 1.0, 1.0, 1.0), 0.25);
+            }
+            if self.reachable.is_some() && !is_dir {
+                color = scale_rgb(color, 0.24);
             }
 
             self.draw_cube.color = color;
@@ -259,9 +262,8 @@ impl CodeMap {
             let rows = node.lines.len().div_ceil(cols);
             let char_w = local_line * CHAR_W;
             let col_w = COL_CHARS * char_w;
-            let base = self.file_color(panel.index);
-            let code_color = mix_rgb(base, vec4(1.0, 1.0, 1.0, 1.0), 0.35);
-            let comment_color = vec4(0.35, 0.48, 0.35, 1.0);
+            let code_color = vec4(0.49, 0.52, 0.56, 1.0);
+            let comment_color = if self.syntax_colors { vec4(0.35, 0.48, 0.35, 1.0) } else { code_color };
             if text_mode {
                 self.draw_code.text_style.font_size = (local_line * 0.6) as f32;
             }
@@ -279,7 +281,7 @@ impl CodeMap {
                     }
                     if let Some(line) = self.text_cache.get(&panel.index).and_then(|text| text.lines.get(i)) {
                         if !line.text.trim().is_empty() {
-                            draw_highlighted_line(&mut self.draw_code, cx2d, line, dvec2(x, y), 1.0);
+                            draw_source_line(&mut self.draw_code, cx2d, line, self.call_highlights.line(&node.path, i + 1), self.relationship_root.as_deref(), self.syntax_colors, dvec2(x, y), 1.0);
                             text_budget -= 1;
                         }
                     }
@@ -291,6 +293,7 @@ impl CodeMap {
                     };
                     let color = if line.comment { comment_color } else { code_color };
                     block(&mut self.draw_block, cx2d, rect, color, vec4(0.0, 0.0, 0.0, 0.0), 0.0, 0.0);
+                    draw_call_strips(&mut self.draw_block, cx2d, self.call_highlights.line(&node.path, i + 1), self.relationship_root.as_deref(), dvec2(x, y), char_w, local_line, 1.0);
                 }
             }
 

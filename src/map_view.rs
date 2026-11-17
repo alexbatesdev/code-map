@@ -9,6 +9,7 @@
 mod city;
 
 use crate::history::{self, History};
+use crate::call_colors::{self, CallHighlights, CallMark};
 use crate::filter::Filter;
 use crate::relationships::{supports_path, Direction, Graph, Reachability, SourceFile};
 use crate::syntax::HighlightedText;
@@ -235,6 +236,10 @@ pub struct CodeMap {
     #[rust]
     color_mode: ColorMode,
     #[rust]
+    syntax_colors: bool,
+    #[rust]
+    call_highlights: CallHighlights,
+    #[rust]
     history: Option<History>,
     #[rust]
     search: String,
@@ -299,6 +304,7 @@ impl CodeMap {
         self.graph_loading = false;
         self.relationship_root = None;
         self.reachable = None;
+        self.call_highlights = CallHighlights::default();
         self.text_cache.clear();
         self.text_pending.clear();
         self.text_order.clear();
@@ -356,6 +362,11 @@ impl CodeMap {
     pub fn set_hide_tests(&mut self, cx: &mut Cx, hide: bool) {
         self.hide_tests = hide;
         self.apply_selection(cx);
+    }
+
+    pub fn set_syntax_colors(&mut self, cx: &mut Cx, on: bool) {
+        self.syntax_colors = on;
+        self.redraw(cx);
     }
 
     pub fn set_relationship_mode(&mut self, cx: &mut Cx, mode: usize) {
@@ -436,6 +447,10 @@ impl CodeMap {
     fn apply_selection(&mut self, cx: &mut Cx) {
         self.tree.update_weights(self.show_ignored);
         self.tree.apply_filter(&self.filter, self.hide_tests, self.reachable.as_ref().map(|r| &r.paths));
+        let visible = self.tree.nodes.iter().enumerate()
+            .filter(|(index, node)| node.is_file() && self.tree.is_visible(*index))
+            .map(|(_, node)| node.path.clone()).collect();
+        self.call_highlights = CallHighlights::new(self.reachable.as_ref().map_or(&[], |r| r.call_sites.as_slice()), &visible);
         self.matches = self.tree.search(&self.search);
         self.match_cursor = 0;
         self.hover = None;
@@ -575,8 +590,9 @@ impl CodeMap {
         if self.relationship_mode > 0 {
             if let Some(reachable) = &self.reachable {
                 let visible = |path: &&String| self.tree.find(path).is_some_and(|index| self.tree.is_visible(index));
-                text.push_str(&format!(" · {} direct / {} indirect files · static calls, depth {}",
-                    reachable.direct.iter().filter(visible).count(), reachable.indirect.iter().filter(visible).count(), self.relationship_depth));
+                text.push_str(&format!(" · {} direct / {} indirect files · depth {}: {} reached methods / {} cross-file call sites",
+                    reachable.direct.iter().filter(visible).count(), reachable.indirect.iter().filter(visible).count(), self.relationship_depth,
+                    reachable.reached_symbols, self.call_highlights.site_count()));
             }
             if let Some(graph) = &self.graph {
                 text.push_str(&format!(" · {} unresolved sites / {} parse errors / {} unread files",
@@ -773,7 +789,7 @@ impl CodeMap {
         }
         if self.relationship_mode > 0 && n.is_file() {
             if self.relationship_root.as_deref() == Some(n.path.as_str()) {
-                details.push_str("\n\nCall root: all methods in this file.");
+                details.push_str("\n\nCall root: all methods in this file.\nDepth counts method-call hops;\ndeeper methods can stay in the\nsame files.");
             } else if let Some(chain) = self.reachable.as_ref().and_then(|r| r.witnesses.get(&n.path)) {
                 details.push_str(if chain.len() == 1 { "\n\nDirect static call" } else { "\n\nIndirect static call path" });
                 for edge in chain {
@@ -782,6 +798,16 @@ impl CodeMap {
                         short_label(&edge.callee.name, 38), short_label(&edge.callee.file, 42), edge.callee.line));
                 }
                 details.push_str("\n\nStatic resolution; execution depends\non runtime inputs and dispatch.");
+            }
+            let connections = self.call_highlights.connections(&n.path);
+            if !connections.is_empty() {
+                details.push_str("\n\nColored calls in this file:");
+                for (line, mark) in connections.iter().take(16) {
+                    details.push_str(&format!("\nL{}:{} → {}", line, mark.start + 1, short_label(&mark.target, 31)));
+                }
+                if connections.len() > 16 { details.push_str(&format!("\n…and {} more call sites", connections.len() - 16)); }
+            } else if self.relationship_mode == 2 {
+                details.push_str("\n\nIncoming call sites are in the\ncaller files. Select one to see\nits colored calls to this file.");
             }
         }
         NodeInfo {
@@ -798,10 +824,9 @@ impl CodeMap {
     /// Base color of a file for the current color mode.
     fn file_color(&self, index: usize) -> Vec4f {
         let node = &self.tree.nodes[index];
-        if let Some(reachable) = &self.reachable {
-            if self.relationship_root.as_deref() == Some(node.path.as_str()) { return vec4(0.95, 0.73, 0.24, 1.0); }
-            if reachable.direct.contains(&node.path) { return vec4(0.2, 0.8, 0.95, 1.0); }
-            if reachable.indirect.contains(&node.path) { return vec4(0.7, 0.45, 0.95, 1.0); }
+        if self.reachable.is_some() && node.is_file() {
+            let [r, g, b] = call_colors::file_rgb(&node.path, self.relationship_root.as_deref());
+            return vec4(r, g, b, 1.0);
         }
         match self.color_mode {
             ColorMode::FileType => match node.kind {
@@ -835,7 +860,7 @@ impl CodeMap {
                 break;
             }
             // search: things off the path to a match fade into the background
-            let fade = if searching && !node.on_path { 0.22 } else { 1.0 };
+            let fade = if searching && self.reachable.is_none() && !node.on_path { 0.22 } else { 1.0 };
             let small = r.size.x.min(r.size.y);
             let border = if small > 8.0 { 1.0 } else { 0.0 };
             match node.kind {
@@ -859,7 +884,7 @@ impl CodeMap {
                     let edge = scale_rgb(base, 0.35 * fade);
                     block(&mut self.draw_block, cx, r, bg, edge, border, if node.ignored { 0.3 } else { 0.0 });
                     quads += 1;
-                    quads += self.draw_code_lines(cx, index, base, fade);
+                    quads += self.draw_code_lines(cx, index, fade);
                 }
                 Kind::Binary => {
                     let base = self.file_color(index);
@@ -893,11 +918,11 @@ impl CodeMap {
     }
 
     /// Returns how many quads were drawn.
-    fn draw_code_lines(&mut self, cx: &mut Cx2d, index: usize, base: Vec4f, fade: f32) -> usize {
+    fn draw_code_lines(&mut self, cx: &mut Cx2d, index: usize, fade: f32) -> usize {
         let node = &self.tree.nodes[index];
         let line_px = node.line_h * self.cam_scale;
         let r_screen = self.to_screen(node.rect);
-        let searching = self.search_active();
+        let searching = self.search_active() && self.reachable.is_none();
         let wants_label = r_screen.size.x > 60.0 && r_screen.size.y > 18.0 && (!searching || node.on_path);
         if line_px < STRIPS_FROM_PX || node.lines.is_empty() {
             if wants_label && self.labels.len() < LABEL_BUDGET {
@@ -916,8 +941,8 @@ impl CodeMap {
             self.ensure_text(cx.cx, index);
         }
         let node = &self.tree.nodes[index];
-        let code_color = scale_rgb(mix_rgb(base, vec4(1.0, 1.0, 1.0, 1.0), 0.35), 0.85 * fade);
-        let comment_color = vec4(0.30 * fade, 0.40 * fade, 0.30 * fade, 1.0);
+        let code_color = vec4(0.49 * fade, 0.52 * fade, 0.56 * fade, 1.0);
+        let comment_color = if self.syntax_colors { vec4(0.30 * fade, 0.40 * fade, 0.30 * fade, 1.0) } else { code_color };
         let mut drawn = 0;
         // only visit the columns and rows that are actually on screen
         let first_col = ((view.pos.x - inner.pos.x) / col_px).floor().max(0.0) as usize;
@@ -935,7 +960,7 @@ impl CodeMap {
                 let y = inner.pos.y + row as f64 * line_px;
                 if text_mode {
                     if let Some(line) = self.text_cache.get(&index).and_then(|text| text.lines.get(k)) {
-                        draw_highlighted_line(&mut self.draw_code, cx, line, dvec2(x, y), fade);
+                        draw_source_line(&mut self.draw_code, cx, line, self.call_highlights.line(&node.path, k + 1), self.relationship_root.as_deref(), self.syntax_colors, dvec2(x, y), fade);
                     }
                 } else if line.len > 0 {
                     let color = if line.comment { comment_color } else { code_color };
@@ -946,6 +971,7 @@ impl CodeMap {
                     };
                     block(&mut self.draw_block, cx, rect, color, vec4(0.0, 0.0, 0.0, 0.0), 0.0, 0.0);
                     drawn += 1;
+                    drawn += draw_call_strips(&mut self.draw_block, cx, self.call_highlights.line(&node.path, k + 1), self.relationship_root.as_deref(), dvec2(x, y), char_px, line_px, fade);
                 }
             }
         }
@@ -1144,6 +1170,9 @@ impl Widget for CodeMap {
 // `CodeMapRef` is generated by `#[derive(Widget)]`: a handle the app uses to
 // reach this widget from outside.
 impl CodeMapRef {
+    pub fn set_syntax_colors(&self, cx: &mut Cx, on: bool) {
+        if let Some(mut inner) = self.borrow_mut() { inner.set_syntax_colors(cx, on); }
+    }
     pub fn set_filter(&self, cx: &mut Cx, query: &str) {
         if let Some(mut inner) = self.borrow_mut() { inner.set_filter(cx, query); }
     }
@@ -1201,16 +1230,29 @@ fn short_label(text: &str, max: usize) -> String {
     else { text.chars().take(max.saturating_sub(1)).chain(['…']).collect() }
 }
 
-fn draw_highlighted_line(draw: &mut DrawText, cx: &mut Cx2d, line: &crate::syntax::HighlightedLine, pos: DVec2, fade: f32) {
+fn draw_source_line(draw: &mut DrawText, cx: &mut Cx2d, line: &crate::syntax::HighlightedLine, marks: &[CallMark], root: Option<&str>, syntax: bool, pos: DVec2, fade: f32) {
     let mut x = pos.x;
-    for run in line.clipped_spans(COL_CHARS as usize) {
-        let [r, g, b] = run.category.rgb();
+    for run in call_colors::paint_line(line, marks, root, syntax, COL_CHARS as usize) {
+        let [r, g, b] = run.color;
         draw.color = vec4(r * fade, g * fade, b * fade, 1.0);
         let width = draw.layout(cx.cx, 0.0, 0.0, None, false, Align::default(), run.text)
             .rows.first().map_or(0.0, |row| row.width_in_lpxs as f64);
         draw.draw_abs(cx, dvec2(x, pos.y), run.text);
         x += width;
     }
+}
+
+fn draw_call_strips(draw: &mut DrawBlock, cx: &mut Cx2d, marks: &[CallMark], root: Option<&str>, pos: DVec2, char_width: f64, line_height: f64, fade: f32) -> usize {
+    let mut count = 0;
+    for mark in marks {
+        let start = mark.start.min(COL_CHARS as usize);
+        let end = mark.end.min(COL_CHARS as usize);
+        if end <= start { continue; }
+        let [r, g, b] = call_colors::file_rgb(&mark.target, root);
+        block(draw, cx, Rect { pos: pos + dvec2(start as f64 * char_width, line_height * 0.18), size: dvec2((end - start) as f64 * char_width, (line_height * 0.64).max(0.5)) }, vec4(r * fade, g * fade, b * fade, 1.0), vec4(0.0, 0.0, 0.0, 0.0), 0.0, 0.0);
+        count += 1;
+    }
+    count
 }
 
 fn block(draw: &mut DrawBlock, cx: &mut Cx2d, rect: Rect, color: Vec4f, edge: Vec4f, border: f32, hatch: f32) {

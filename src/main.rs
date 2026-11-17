@@ -6,6 +6,7 @@
 pub use makepad_widgets;
 
 mod history;
+mod call_colors;
 mod filter;
 mod relationships;
 mod syntax;
@@ -60,6 +61,7 @@ script_mod! {
                         three_d := CheckBox{text: "3D" active: false}
                         fit_button := Button{text: "Fit"}
                         show_ignored := CheckBox{text: "Show ignored" active: true}
+                        syntax_colors := CheckBox{text: "Syntax colors" active: false}
                     }
                     filters := View{
                         width: Fill height: 38
@@ -84,13 +86,13 @@ script_mod! {
                             labels: ["All files" "Calls from root" "Callers of root"]
                         }
                         trace_selected := Button{text: "Trace selected file"}
-                        Label{text: "Depth"}
+                        Label{text: "Call depth"}
                         relationship_depth := DropDown{
                             width: 80
                             labels: ["1" "2" "3" "5" "8"]
                         }
                         relationship_root := InfoLabel{width: Fill text: "Select a source file to trace its calls"}
-                        InfoLabel{text: "Root: gold   Direct: cyan   Indirect: purple"}
+                        InfoLabel{text: "Call text and destination file share a color"}
                     }
                     View{
                         width: Fill height: Fill
@@ -171,6 +173,9 @@ impl MatchEvent for App {
         }
         if let Some(hide) = self.ui.check_box(cx, ids!(hide_tests)).changed(actions) {
             map.set_hide_tests(cx, hide);
+        }
+        if let Some(on) = self.ui.check_box(cx, ids!(syntax_colors)).changed(actions) {
+            map.set_syntax_colors(cx, on);
         }
         if let Some(mode) = self.ui.drop_down(cx, ids!(relationship_mode)).changed(actions) {
             map.set_relationship_mode(cx, mode);

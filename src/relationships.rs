@@ -38,6 +38,9 @@ pub struct CallEdge {
     pub caller: SymbolRef,
     pub callee: SymbolRef,
     pub line: usize,
+    /// Zero-based rendered Unicode scalar columns; end is exclusive and each tab occupies four.
+    pub start_column: usize,
+    pub end_column: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -52,6 +55,8 @@ pub struct Reachability {
     pub direct: HashSet<String>,
     pub indirect: HashSet<String>,
     pub witnesses: HashMap<String, Vec<CallEdge>>,
+    pub call_sites: Vec<CallEdge>,
+    pub reached_symbols: usize,
 }
 
 #[derive(Debug, Default)]
@@ -110,6 +115,7 @@ impl Graph {
         let depth = depth.min(MAX_DEPTH);
         if depth == 0 { return result; }
         let mut visited = vec![false; self.symbols.len()];
+        let mut visited_edges = HashSet::new();
         let mut queue = VecDeque::new();
         for &root in roots {
             visited[root] = true;
@@ -119,10 +125,12 @@ impl Graph {
             if chain.len() == depth { continue; }
             let edges = match direction { Direction::Callees => &self.outgoing[at], Direction::Callers => &self.incoming[at] };
             for &edge in edges {
+                if visited_edges.insert(edge) { result.call_sites.push(self.edges[edge].clone()); }
                 let (caller, callee) = self.endpoints[edge];
                 let next = match direction { Direction::Callees => callee, Direction::Callers => caller };
                 if visited[next] { continue; }
                 visited[next] = true;
+                result.reached_symbols += 1;
                 let mut witness = chain.clone();
                 match direction {
                     Direction::Callees => witness.push(edge),
@@ -188,7 +196,14 @@ struct JsCall {
     class: Option<(usize, bool)>,
     target: Expr,
     constructor: bool,
+    site: CallSite,
+}
+
+#[derive(Clone, Copy)]
+struct CallSite {
     line: usize,
+    start_column: usize,
+    end_column: usize,
 }
 
 #[derive(Clone)]
@@ -216,7 +231,7 @@ struct RubyCall {
     receiver: RubyReceiver,
     method: String,
     bare: bool,
-    line: usize,
+    site: CallSite,
 }
 
 struct Builder<'a> {
@@ -260,6 +275,15 @@ impl<'a> Builder<'a> {
 
     fn text(&self, file: usize, node: Node<'_>) -> &str {
         &self.sources[file].text[node.byte_range()]
+    }
+
+    fn call_site(&self, file: usize, node: Node<'_>) -> CallSite {
+        let position = node.start_position();
+        let prefix = &self.sources[file].text[node.start_byte() - position.column..node.start_byte()];
+        let columns = |text: &str| text.chars().map(|c| if c == '\t' { 4 } else { 1 }).sum::<usize>();
+        let start_column = columns(prefix);
+        let name = self.text(file, node).split(['\r', '\n']).next().unwrap_or("");
+        CallSite { line: position.row + 1, start_column, end_column: start_column + columns(name) }
     }
 
     fn symbol(&mut self, file: usize, name: String, line: usize) -> usize {
@@ -456,9 +480,14 @@ impl<'a> Builder<'a> {
             }
             "call_expression" | "new_expression" => {
                 let constructor = kind == "new_expression";
-                let target = node.child_by_field_name(if constructor { "constructor" } else { "function" })
-                    .map(|n| Self::expression(n, file, &self.sources[file].text)).unwrap_or(Expr::Unknown);
-                self.js_calls.push(JsCall { caller, scope, class, target, constructor, line: node.start_position().row + 1 });
+                let function = node.child_by_field_name(if constructor { "constructor" } else { "function" });
+                let target = function.map(|n| Self::expression(n, file, &self.sources[file].text)).unwrap_or(Expr::Unknown);
+                let site = function.and_then(Self::js_call_name).map(|name| self.call_site(file, name)).unwrap_or_else(|| {
+                    let mut site = self.call_site(file, node);
+                    site.end_column = site.start_column;
+                    site
+                });
+                self.js_calls.push(JsCall { caller, scope, class, target, constructor, site });
             }
             "return_statement" => {
                 if let Some((class_id, false)) = class {
@@ -594,6 +623,15 @@ impl<'a> Builder<'a> {
             "parenthesized_expression" | "non_null_expression" | "as_expression" | "satisfies_expression" | "instantiation_expression" => named(node).first().map(|&n| Self::expression(n, file, text)).unwrap_or(Expr::Unknown),
             "function_expression" | "generator_function" | "arrow_function" | "class" => Expr::Inline(file, node.start_byte()),
             _ => Expr::Unknown,
+        }
+    }
+
+    fn js_call_name(node: Node<'_>) -> Option<Node<'_>> {
+        match node.kind() {
+            "identifier" | "property_identifier" | "private_property_identifier" => Some(node),
+            "member_expression" => node.child_by_field_name("property").and_then(Self::js_call_name),
+            "parenthesized_expression" | "non_null_expression" | "as_expression" | "satisfies_expression" | "instantiation_expression" => named(node).first().copied().and_then(Self::js_call_name),
+            _ => None,
         }
     }
 
@@ -738,7 +776,7 @@ impl<'a> Builder<'a> {
             "call" => {
                 if let Some(method) = node.child_by_field_name("method") {
                     let receiver = node.child_by_field_name("receiver").map(|n| self.ruby_receiver(n, file)).unwrap_or(RubyReceiver::Implicit);
-                    self.ruby_calls.push(RubyCall { file, context: context.clone(), receiver, method: self.text(file, method).into(), bare: false, line: node.start_position().row + 1 });
+                    self.ruby_calls.push(RubyCall { file, context: context.clone(), receiver, method: self.text(file, method).into(), bare: false, site: self.call_site(file, method) });
                 }
                 for field in ["receiver", "arguments", "block"] {
                     if let Some(child) = node.child_by_field_name(field) { self.ruby(child, file, context); }
@@ -746,7 +784,7 @@ impl<'a> Builder<'a> {
                 return;
             }
             "identifier" => {
-                self.ruby_calls.push(RubyCall { file, context: context.clone(), receiver: RubyReceiver::Implicit, method: self.text(file, node).into(), bare: true, line: node.start_position().row + 1 });
+                self.ruby_calls.push(RubyCall { file, context: context.clone(), receiver: RubyReceiver::Implicit, method: self.text(file, node).into(), bare: true, site: self.call_site(file, node) });
                 return;
             }
             "assignment" | "operator_assignment" => {
@@ -899,20 +937,21 @@ impl<'a> Builder<'a> {
             let target = if call.constructor {
                 match target { Binding::Class(class) => self.js_method(class, false, "constructor"), _ => None }
             } else { match target { Binding::Callable(id) => Some(id), _ => None } };
-            if let Some(target) = target { links.push((call.caller, target, call.line)); }
+            if let Some(target) = target { links.push((call.caller, target, call.site)); }
             else { self.graph.unresolved_sites += 1; }
         }
         for call in &self.ruby_calls {
-            if let Some(target) = self.ruby_target(call) { links.push((call.context.caller, target, call.line)); }
+            if let Some(target) = self.ruby_target(call) { links.push((call.context.caller, target, call.site)); }
             else if !call.bare || !self.ruby_local(call.context.scope, &call.method) { self.graph.unresolved_sites += 1; }
         }
         self.graph.outgoing = vec![Vec::new(); self.graph.symbols.len()];
         self.graph.incoming = vec![Vec::new(); self.graph.symbols.len()];
         let mut unique = HashSet::new();
-        for (caller, callee, line) in links {
-            if !unique.insert((caller, callee, line)) { continue; }
+        for (caller, callee, site) in links {
+            let CallSite { line, start_column, end_column } = site;
+            if !unique.insert((caller, callee, line, start_column, end_column)) { continue; }
             let id = self.graph.edges.len();
-            self.graph.edges.push(CallEdge { caller: self.graph.symbols[caller].clone(), callee: self.graph.symbols[callee].clone(), line });
+            self.graph.edges.push(CallEdge { caller: self.graph.symbols[caller].clone(), callee: self.graph.symbols[callee].clone(), line, start_column, end_column });
             self.graph.endpoints.push((caller, callee));
             self.graph.outgoing[caller].push(id);
             self.graph.incoming[callee].push(id);
@@ -959,6 +998,104 @@ mod tests {
 
     fn graph(files: &[(&str, &str)]) -> Graph {
         Graph::build(&files.iter().map(|(path, text)| SourceFile { path: (*path).into(), text: (*text).into() }).collect::<Vec<_>>(), None)
+    }
+
+    #[test]
+    fn separate_calls_to_the_same_method_on_one_line_keep_each_occurrence() {
+        let js = graph(&[
+            ("a.js", "import {run} from './b'; export function start() { run(run()); run(); }"),
+            ("b.js", "export function run() {}"),
+        ]);
+        assert_eq!(js.parse_errors, 0);
+        assert_eq!(js.edges.len(), 3);
+        let ruby = graph(&[
+            ("a.rb", "class A\n def self.start; B.run(B.run); B.run; end\nend"),
+            ("b.rb", "class B\n def self.run; end\nend"),
+        ]);
+        assert_eq!(ruby.parse_errors, 0);
+        assert_eq!(ruby.edges.len(), 3);
+        assert_eq!(js.related("a.js", Direction::Callees, 1).call_sites.len(), 3);
+        assert_eq!(ruby.related("a.rb", Direction::Callees, 1).call_sites.len(), 3);
+    }
+
+    fn assert_call_names(graph: &Graph, file: &str, source: &str, expected: &[(usize, &str)]) {
+        let lines: Vec<_> = source.lines().map(|line| line.replace('\t', "    ")).collect();
+        let mut actual: Vec<_> = graph.edges.iter().filter(|edge| edge.caller.file == file).map(|edge| {
+            let name: String = lines[edge.line - 1].chars().skip(edge.start_column).take(edge.end_column - edge.start_column).collect();
+            (edge.line, edge.start_column, edge.end_column, name)
+        }).collect();
+        actual.sort();
+        let mut positions = HashMap::<usize, usize>::new();
+        let expected: Vec<_> = expected.iter().map(|&(line, name)| {
+            let text = &lines[line - 1];
+            let next = positions.entry(line).or_default();
+            let byte = *next + text[*next..].find(name).unwrap();
+            *next = byte + name.len();
+            let start = text[..byte].chars().count();
+            (line, start, start + name.chars().count(), name.to_owned())
+        }).collect();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn javascript_call_ranges_select_names_in_rendered_unicode_and_multiline_source() {
+        let source = "import {run, Worker} from './b'; import * as api from './b';\nexport function start() {\n\tconst café = '🙂界'; run(run()); run?.(\n\t\t'arg'\n\t);\n\tapi?.run?.(); new api.Worker(\n\t); new Worker().go();\n\tapi\n\t .run();\n}";
+        let graph = graph(&[("a.js", source), ("b.js", "export function run() {} export class Worker { constructor() {} go() {} }")]);
+        assert_eq!(graph.parse_errors, 0);
+        assert_call_names(&graph, "a.js", source, &[(3, "run"), (3, "run"), (3, "run"), (6, "run"), (6, "Worker"), (7, "Worker"), (7, "go"), (9, "run")]);
+    }
+
+    #[test]
+    fn typescript_call_ranges_unwrap_function_expressions_without_including_wrappers() {
+        let source = "import {run} from './b';\nexport function start() {\n\tconst café = '🙂'; (run)(); run!(); (run as Function)(); run<string>();\n}";
+        let graph = graph(&[("a.ts", source), ("b.ts", "export function run<T>() {}")]);
+        assert_eq!(graph.parse_errors, 0);
+        assert_call_names(&graph, "a.ts", source, &[(3, "run"), (3, "run"), (3, "run"), (3, "run")]);
+    }
+
+    #[test]
+    fn ruby_call_ranges_select_methods_and_bare_names_after_unicode_and_tabs() {
+        let source = "class A\n def self.start\n\t'🙂界'; B.run(B.run); B.run(\n\t 1\n\t); B.new.go\n\tB\n\t .run\n\thelper; helper()\n end\n def self.helper; end\nend";
+        let graph = graph(&[("a.rb", source), ("b.rb", "class B\n def self.run(*args); end\n def initialize; end\n def go; end\nend")]);
+        assert_eq!(graph.parse_errors, 0);
+        assert_call_names(&graph, "a.rb", source, &[(3, "run"), (3, "run"), (3, "run"), (5, "new"), (5, "go"), (7, "run"), (8, "helper"), (8, "helper")]);
+    }
+
+    #[test]
+    fn deeper_symbols_add_call_sites_when_the_reached_file_set_stays_the_same() {
+        let graph = graph(&[
+            ("a.js", "import {entry} from './b'; import {leaf} from './c'; export function start() { entry(); leaf(); }"),
+            ("b.js", "import {middle} from './c'; import {unrelated} from './d'; export function entry() { middle(); } export function other() { unrelated(); }"),
+            ("c.js", "import {entry} from './b'; export function middle() { leaf(); } export function leaf() { entry(); }"),
+            ("d.js", "export function unrelated() {}"),
+        ]);
+        let shallow = graph.related("a.js", Direction::Callees, 1);
+        let deep = graph.related("a.js", Direction::Callees, 8);
+        assert_eq!(shallow.paths, HashSet::from(["a.js".into(), "b.js".into(), "c.js".into()]));
+        assert_eq!(deep.paths, shallow.paths);
+        assert_eq!((shallow.reached_symbols, deep.reached_symbols), (2, 3));
+        assert_eq!((shallow.call_sites.len(), deep.call_sites.len()), (2, 5));
+        assert!(!deep.call_sites.iter().any(|edge| edge.caller.name == "other" || edge.callee.file == "d.js"));
+        assert_eq!(deep.call_sites.iter().filter(|edge| edge.caller.name == "leaf" && edge.callee.name == "entry").count(), 1);
+        assert_eq!(deep.witnesses, shallow.witnesses);
+        let empty = graph.related("a.js", Direction::Callees, 0);
+        assert!(empty.call_sites.is_empty());
+        assert_eq!(empty.reached_symbols, 0);
+    }
+
+    #[test]
+    fn caller_traversal_preserves_repeated_and_cyclic_call_sites_once() {
+        let graph = graph(&[
+            ("a.js", "import {b} from './b'; export function a() { b(); b(); }"),
+            ("b.js", "import {a} from './a'; export function b() { a(); }"),
+        ]);
+        let shallow = graph.related("b.js", Direction::Callers, 1);
+        assert_eq!(shallow.call_sites.len(), 2);
+        assert_eq!(shallow.reached_symbols, 1);
+        let deep = graph.related("b.js", Direction::Callers, 8);
+        assert_eq!(deep.call_sites.len(), 3);
+        assert_eq!(deep.reached_symbols, 1);
+        assert_eq!(deep.paths, shallow.paths);
     }
 
     #[test]

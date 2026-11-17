@@ -12,12 +12,19 @@ original map. The normal file map stays available in both 2D and 3D.
   Invalid expressions keep the last valid filter and display an error.
 - **Call paths:** select a Ruby, JavaScript or TypeScript file, then choose
   **Trace selected file**. **Calls from root** follows callees; **Callers of root**
-  follows callers. Depth limits traversal to 1, 2, 3, 5 or 8 method calls. Gold
-  marks the root, cyan a direct file connection, and purple an indirect one.
+  follows callers. Depth limits traversal to 1, 2, 3, 5 or 8 method calls. Deeper
+  calls can stay inside files already visible, so file counts can remain the
+  same. The status bar also reports reached methods and cross-file call sites.
+  Gold marks the root; other files have stable colors. Resolved calls in the
+  source use the same color as their destination file, including in the line
+  minimaps. Ordinary source text is neutral by default; **Syntax colors** opts
+  back into language colors while retaining call colors.
   Select a connected file for the method names and call-site lines that explain
   its connection. Select **All files** to leave the relationship view.
-- **Source colors:** Ruby, JS/JSX and TS/TSX use Tree-sitter highlighting once
-  source text becomes readable. Parsing runs on a background worker and is
+- **Source colors:** the trace view highlights exact resolved method-call names
+  at readable zoom. The inspector lists their source lines and columns. Incoming
+  call sites are in the caller files; select one to see its calls into the root.
+  Optional Ruby, JS/JSX and TS/TSX syntax colors use Tree-sitter. Parsing runs on a background worker and is
   cached for both map views. Unsupported languages and files above 2 MiB retain
   plain text. The code map's existing column clipping still applies.
 
