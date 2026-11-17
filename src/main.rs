@@ -123,11 +123,42 @@ script_mod! {
                             }
                         }
                     }
-                    status := Label{
+                    View{
                         width: Fill height: 26
-                        text: ""
-                        padding: Inset{left: 12, right: 12, top: 6}
-                        draw_text +: {color: #x8a949e text_style +: {font_size: 9.0}}
+                        flow: Right
+                        padding: Inset{right: 12}
+                        status := Label{
+                            width: Fill height: Fill
+                            text: ""
+                            padding: Inset{left: 12, right: 12, top: 6}
+                            draw_text +: {color: #x8a949e text_style +: {font_size: 9.0}}
+                        }
+                        loading_indicator := LoadingSpinner{
+                            width: 28 height: 26
+                            visible: false
+                            draw_bg +: {
+                                pixel: fn() {
+                                    let sdf = Sdf2d.viewport(self.pos * vec2(32.0, 28.0))
+                                    let pulse = 0.65 + 0.35 * sin(self.draw_pass.time * 4.18879)
+                                    let gold = vec4(1.0, 0.78, 0.22, pulse)
+                                    sdf.move_to(16.0, 1.0)
+                                    sdf.line_to(23.0, 13.0)
+                                    sdf.line_to(9.0, 13.0)
+                                    sdf.close_path()
+                                    sdf.fill(gold)
+                                    sdf.move_to(8.0, 14.0)
+                                    sdf.line_to(15.0, 26.0)
+                                    sdf.line_to(1.0, 26.0)
+                                    sdf.close_path()
+                                    sdf.fill(gold)
+                                    sdf.move_to(24.0, 14.0)
+                                    sdf.line_to(31.0, 26.0)
+                                    sdf.line_to(17.0, 26.0)
+                                    sdf.close_path()
+                                    return sdf.fill(gold)
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -242,5 +273,11 @@ impl AppMain for App {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event) {
         self.match_event(cx, event);
         self.ui.handle_event(cx, event, &mut Scope::empty());
+        let loading = self.ui.code_map(cx, ids!(map)).is_loading();
+        let indicator = self.ui.view(cx, ids!(loading_indicator));
+        indicator.set_visible(cx, loading);
+        if loading && matches!(event, Event::NextFrame(_)) {
+            indicator.redraw(cx);
+        }
     }
 }

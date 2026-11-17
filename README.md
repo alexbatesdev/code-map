@@ -27,6 +27,9 @@ original map. The normal file map stays available in both 2D and 3D.
   Optional Ruby, JS/JSX and TS/TSX syntax colors use Tree-sitter. Parsing runs on a background worker and is
   cached for both map views. Unsupported languages and files above 2 MiB retain
   plain text. The code map's existing column clipping still applies.
+- **Loading:** a gold Triforce pulses in the bottom-right corner while background
+  scans, history, call indexing, folder expansion or source loading are pending.
+  It disappears when all pending work finishes.
 
 Call paths traverse method/function symbols before grouping them into files.
 If A calls `B.run`, and only the unrelated `B.other` calls C, A does not acquire
