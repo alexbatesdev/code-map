@@ -29,6 +29,8 @@ struct Association {
 #[derive(Default)]
 pub(super) struct RubyTypes {
     classes: HashMap<String, Vec<ConstantName>>,
+    loaded_models: HashSet<String>,
+    loaded_targets: HashMap<(String, String), RubyValue>,
     parents: HashMap<String, Option<String>>,
     readers: HashMap<(String, String), Option<String>>,
     associations: HashMap<(String, String), Vec<Association>>,
@@ -86,7 +88,26 @@ impl RubyTypes {
         }
     }
 
+    pub fn load_model(&mut self, owner: &str) { self.loaded_models.insert(owner.into()); }
+
+    pub fn load_association(&mut self, owner: &str, name: &str, target: &str, collection: bool) {
+        let value = if collection { RubyValue::Relation(target.into()) } else { RubyValue::Instance(target.into()) };
+        self.loaded_targets.insert((owner.into(), name.into()), value);
+    }
+
+    pub fn loaded_association(&self, owner: &str, name: &str) -> Option<RubyValue> {
+        self.loaded_targets.get(&(owner.into(), name.into())).cloned()
+    }
+
     pub fn is_active_record(&self, owner: &str) -> bool {
+        self.loaded_models.contains(owner) || self.source_active_record(owner)
+    }
+
+    pub fn requires_loaded_model(&self, owner: &str) -> bool {
+        self.loaded_models.contains(owner) && !self.source_active_record(owner)
+    }
+
+    fn source_active_record(&self, owner: &str) -> bool {
         let mut current = owner;
         let mut seen = HashSet::new();
         loop {

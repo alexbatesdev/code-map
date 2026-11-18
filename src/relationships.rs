@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use tree_sitter::{Node, Parser};
+use crate::evidence::{EvidenceFilter, EvidenceKind, Snapshot};
 
 mod ruby_types;
 mod ruby_flow;
@@ -31,7 +32,7 @@ pub struct SourceFile {
     pub text: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct SymbolRef {
     pub name: String,
     pub file: String,
@@ -47,6 +48,7 @@ pub struct CallEdge {
     pub start_column: usize,
     pub end_column: usize,
     pub inference: Option<String>,
+    pub evidence: EvidenceKind,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -83,7 +85,11 @@ impl Graph {
     /// Paths and base_url are project-relative, with '/' separators.
     /// Only explicit baseUrl roots participate in non-relative import resolution.
     pub fn build(sources: &[SourceFile], base_url: Option<&str>) -> Self {
-        let mut builder = Builder::new(sources, base_url);
+        Self::build_with_snapshot(sources, base_url, None)
+    }
+
+    pub fn build_with_snapshot(sources: &[SourceFile], base_url: Option<&str>, snapshot: Option<&Snapshot>) -> Self {
+        let mut builder = Builder::new(sources, base_url, snapshot);
         let mut parser = Parser::new();
         for (file, source) in sources.iter().enumerate() {
             let Some(language) = parser_language(&source.path) else { continue };
@@ -115,6 +121,10 @@ impl Graph {
 
     /// Traverses symbols first; only then groups shortest witnesses by file.
     pub fn related(&self, file: &str, direction: Direction, depth: usize) -> Reachability {
+        self.related_filtered(file, direction, depth, EvidenceFilter::default())
+    }
+
+    pub fn related_filtered(&self, file: &str, direction: Direction, depth: usize, filter: EvidenceFilter) -> Reachability {
         let mut result = Reachability::default();
         result.paths.insert(file.to_owned());
         let Some(roots) = self.files.get(file) else { return result };
@@ -131,6 +141,7 @@ impl Graph {
             if chain.len() == depth { continue; }
             let edges = match direction { Direction::Callees => &self.outgoing[at], Direction::Callers => &self.incoming[at] };
             for &edge in edges {
+                if !filter.allows(self.edges[edge].evidence) { continue; }
                 if visited_edges.insert(edge) { result.call_sites.push(self.edges[edge].clone()); }
                 let (caller, callee) = self.endpoints[edge];
                 let next = match direction { Direction::Callees => callee, Direction::Callers => caller };
@@ -243,6 +254,7 @@ struct RubyCall {
 
 struct Builder<'a> {
     sources: &'a [SourceFile],
+    snapshot: Option<&'a Snapshot>,
     base_url: Option<String>,
     graph: Graph,
     scopes: Vec<Scope>,
@@ -264,22 +276,24 @@ struct Builder<'a> {
     ruby_top_methods: HashMap<(usize, String), Vec<usize>>,
     ruby_types: RubyTypes,
     ruby_flow: RubyFlow,
+    evidence_symbols: HashMap<SymbolRef, Option<usize>>,
 }
 
 impl<'a> Builder<'a> {
-    fn new(sources: &'a [SourceFile], base_url: Option<&str>) -> Self {
+    fn new(sources: &'a [SourceFile], base_url: Option<&str>, snapshot: Option<&'a Snapshot>) -> Self {
         let mut module_paths: HashMap<String, Vec<usize>> = HashMap::new();
         for (i, source) in sources.iter().enumerate() {
             module_paths.entry(normalize(&source.path)).or_default().push(i);
         }
         Self {
-            sources, base_url: base_url.map(normalize), graph: Graph::default(), scopes: Vec::new(),
+            sources, snapshot, base_url: base_url.map(normalize), graph: Graph::default(), scopes: Vec::new(),
             file_scopes: vec![None; sources.len()], module_paths, classes: Vec::new(),
             node_values: HashMap::new(), exports: vec![HashMap::new(); sources.len()],
             js_calls: Vec::new(), assignments: Vec::new(), member_assignments: Vec::new(),
             ruby_calls: Vec::new(), ruby_classes: HashSet::new(), ruby_constants: HashSet::new(), ruby_assigned_constants: HashSet::new(), ruby_qualified_assignments: Vec::new(), ruby_inherited_classes: HashSet::new(), ruby_methods: HashMap::new(),
             ruby_top_methods: HashMap::new(),
             ruby_types: RubyTypes::default(), ruby_flow: RubyFlow::default(),
+            evidence_symbols: HashMap::new(),
         }
     }
 
@@ -905,18 +919,20 @@ impl<'a> Builder<'a> {
         }
     }
 
-    fn ruby_target(&self, call: &RubyCall) -> Option<(usize, Option<String>)> {
+    fn ruby_target(&self, call: &RubyCall) -> Option<(usize, Option<String>, EvidenceKind)> {
         let implicit = matches!(call.receiver, RubyReceiver::Implicit | RubyReceiver::SelfValue);
         if call.bare && self.ruby_local(call.context.scope, &call.method) { return None; }
-        let (owner, singleton, inference) = match &call.receiver {
-            RubyReceiver::Implicit | RubyReceiver::SelfValue => (call.context.class.clone(), call.context.singleton, None),
-            RubyReceiver::Constant(raw) => (self.ruby_constant(raw, &call.context.nesting), true, None),
+        let (owner, singleton, inference, loaded) = match &call.receiver {
+            RubyReceiver::Implicit | RubyReceiver::SelfValue => (call.context.class.clone(), call.context.singleton, None, false),
+            RubyReceiver::Constant(raw) => (self.ruby_constant(raw, &call.context.nesting), true, None, false),
             RubyReceiver::Instance(raw) => {
                 let owner = self.ruby_constant(raw, &call.context.nesting)?;
                 if self.ruby_method(&owner, true, "new").ok()?.is_some_and(|id| !self.ruby_flow.generated.contains_key(&id)) { return None; }
                 if self.ruby_inherited_classes.contains(&owner) && !self.ruby_types.is_active_record(&owner) { return None; }
                 let inference = self.ruby_types.is_active_record(&owner).then(|| format!("Rails constructed receiver: {owner}.new"));
-                (Some(owner), false, inference)
+                let loaded = self.ruby_types.requires_loaded_model(&owner);
+                let inference = if loaded { Some(format!("Loaded app model ancestry; {}", inference.unwrap_or_default())) } else { inference };
+                (Some(owner), false, inference, loaded)
             }
             RubyReceiver::Value(expr) => {
                 let typed = self.ruby_value(expr, call.file, &call.context, &mut HashSet::new(), 0)?;
@@ -925,7 +941,7 @@ impl<'a> Builder<'a> {
                     RubyValue::Instance(owner) => (owner, false),
                     RubyValue::Relation(_) => return None,
                 };
-                (Some(owner), singleton, typed.reason)
+                (Some(owner), singleton, typed.reason, typed.loaded)
             }
             RubyReceiver::Unknown => return None,
         };
@@ -942,11 +958,15 @@ impl<'a> Builder<'a> {
                     (None, Some(b)) => Some(b.clone()),
                     _ => None,
                 };
-                (id, reason)
+                let dispatch = self.ruby_loaded_dispatch_reason(&owner, singleton, method, id);
+                let loaded = loaded || dispatch.is_some() || self.ruby_flow.loaded_symbols.contains(&id);
+                let reason = match (reason, dispatch) { (Some(a), Some(b)) => Some(format!("{a}; {b}")), (Some(a), None) => Some(a), (None, value) => value };
+                let kind = if loaded { EvidenceKind::Loaded } else if reason.is_some() { EvidenceKind::Inferred } else { EvidenceKind::Source };
+                (id, reason, kind)
             });
         }
         if implicit && call.context.class.is_none() {
-            return self.ruby_top_methods.get(&(call.file, call.method.clone())).filter(|ids| ids.len() == 1).map(|ids| (ids[0], None));
+            return self.ruby_top_methods.get(&(call.file, call.method.clone())).filter(|ids| ids.len() == 1).map(|ids| (ids[0], None, EvidenceKind::Source));
         }
         None
     }
@@ -972,6 +992,7 @@ impl<'a> Builder<'a> {
         let mut types = std::mem::take(&mut self.ruby_types);
         types.resolve(|raw, nesting| self.ruby_framework_constant(raw, nesting));
         self.ruby_types = types;
+        self.ruby_load_snapshot();
         self.ruby_generated_methods();
         for (mut scope, name) in self.assignments.clone() {
             loop {
@@ -996,21 +1017,22 @@ impl<'a> Builder<'a> {
             let target = if call.constructor {
                 match target { Binding::Class(class) => self.js_method(class, false, "constructor"), _ => None }
             } else { match target { Binding::Callable(id) => Some(id), _ => None } };
-            if let Some(target) = target { links.push((call.caller, target, call.site, None)); }
+            if let Some(target) = target { links.push((call.caller, target, call.site, None, EvidenceKind::Source)); }
             else { self.graph.unresolved_sites += 1; }
         }
         for call in &self.ruby_calls {
-            if let Some((target, inference)) = self.ruby_target(call) { links.push((call.context.caller, target, call.site, inference)); }
+            if let Some((target, inference, kind)) = self.ruby_target(call) { links.push((call.context.caller, target, call.site, inference, kind)); }
             else if !call.bare || !self.ruby_local(call.context.scope, &call.method) { self.graph.unresolved_sites += 1; }
         }
+        self.ruby_observed_links(&mut links);
         self.graph.outgoing = vec![Vec::new(); self.graph.symbols.len()];
         self.graph.incoming = vec![Vec::new(); self.graph.symbols.len()];
         let mut unique = HashSet::new();
-        for (caller, callee, site, inference) in links {
+        for (caller, callee, site, inference, evidence) in links {
             let CallSite { line, start_column, end_column } = site;
-            if !unique.insert((caller, callee, line, start_column, end_column)) { continue; }
+            if !unique.insert((caller, callee, line, start_column, end_column, evidence)) { continue; }
             let id = self.graph.edges.len();
-            self.graph.edges.push(CallEdge { caller: self.graph.symbols[caller].clone(), callee: self.graph.symbols[callee].clone(), line, start_column, end_column, inference });
+            self.graph.edges.push(CallEdge { caller: self.graph.symbols[caller].clone(), callee: self.graph.symbols[callee].clone(), line, start_column, end_column, inference, evidence });
             self.graph.endpoints.push((caller, callee));
             self.graph.outgoing[caller].push(id);
             self.graph.incoming[callee].push(id);
@@ -1054,6 +1076,143 @@ fn normalize(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn snapshot_graph(files: &[(&str, &str)], classes: serde_json::Value, calls: serde_json::Value) -> (Graph, Graph, Snapshot) {
+        let sources: Vec<_> = files.iter().map(|(path, text)| SourceFile { path: (*path).into(), text: (*text).into() }).collect();
+        let checksums: serde_json::Map<_, _> = sources.iter().map(|source| (source.path.clone(), serde_json::Value::String(crate::evidence::fingerprint(&source.text)))).collect();
+        let context: Vec<_> = sources.iter().filter(|source| source.path.ends_with(".rb")).map(|source| source.path.as_str()).collect();
+        let json = serde_json::json!({"version":1,"label":"fixture request","context_files":context,"files":checksums,"classes":classes,"calls":calls});
+        let snapshot = Snapshot::parse(&json.to_string(), &sources).unwrap();
+        (Graph::build(&sources, None), Graph::build_with_snapshot(&sources, None, Some(&snapshot)), snapshot)
+    }
+
+    #[test]
+    fn observed_dynamic_receiver_calls_add_real_targets_without_changing_static_fallback() {
+        let (baseline, graph, snapshot) = snapshot_graph(&[
+            ("company.rb", "class Company\n  def run; end\nend"),
+            ("worker.rb", "class Worker\n  def perform(compy)\n    compy.run\n  end\nend"),
+        ], serde_json::json!([]), serde_json::json!([{
+            "caller":{"name":"Worker#perform","file":"worker.rb","line":2},
+            "callee":{"name":"Company#run","file":"company.rb","line":2},"line":3,"method":"run","count":2
+        }]));
+        assert!(snapshot.warnings.is_empty());
+        assert!(!baseline.edges.iter().any(|edge| edge.callee.name == "Company#run"));
+        let edge = graph.edges.iter().find(|edge| edge.callee.name == "Company#run").unwrap();
+        assert_eq!(edge.evidence, EvidenceKind::Observed);
+        assert_eq!((edge.line, edge.start_column, edge.end_column), (3, 10, 13));
+        assert!(edge.inference.as_deref().unwrap().contains("2 call(s)"));
+        let source_only = EvidenceFilter { source: true, inferred: false, loaded: false, observed: false };
+        assert!(!graph.related_filtered("worker.rb", Direction::Callees, 8, source_only).paths.contains("company.rb"));
+        assert!(graph.related("worker.rb", Direction::Callees, 1).direct.contains("company.rb"));
+    }
+
+    #[test]
+    fn observed_and_source_provenance_remain_independently_filterable() {
+        let (_, graph, _) = snapshot_graph(&[
+            ("company.rb", "class Company; def self.run; end; end"),
+            ("worker.rb", "class Worker; def self.perform; Company.run; end; end"),
+        ], serde_json::json!([]), serde_json::json!([{
+            "caller":{"name":"Worker.perform","file":"worker.rb","line":1},
+            "callee":{"name":"Company.run","file":"company.rb","line":1},"line":1,"method":"run","count":1
+        }]));
+        let kinds: HashSet<_> = graph.edges.iter().filter(|edge| edge.callee.name == "Company.run").map(|edge| edge.evidence).collect();
+        assert_eq!(kinds, HashSet::from([EvidenceKind::Source, EvidenceKind::Observed]));
+        for kind in [EvidenceKind::Source, EvidenceKind::Observed] {
+            let filter = EvidenceFilter { source: kind == EvidenceKind::Source, inferred: false, loaded: false, observed: kind == EvidenceKind::Observed };
+            let related = graph.related_filtered("worker.rb", Direction::Callees, 1, filter);
+            assert!(related.direct.contains("company.rb"));
+            assert!(related.call_sites.iter().all(|edge| edge.evidence == kind));
+        }
+    }
+
+    #[test]
+    fn repeated_same_line_method_names_keep_observed_dependency_without_guessing_a_click_span() {
+        let (_, graph, _) = snapshot_graph(&[
+            ("company.rb", "class Company; def run; end; end"),
+            ("worker.rb", "class Worker; def perform(compy); compy.run; compy.run; end; end"),
+        ], serde_json::json!([]), serde_json::json!([{
+            "caller":{"name":"Worker#perform","file":"worker.rb","line":1},
+            "callee":{"name":"Company#run","file":"company.rb","line":1},"line":1,"method":"run","count":1
+        }]));
+        let edge = graph.edges.iter().find(|edge| edge.evidence == EvidenceKind::Observed).unwrap();
+        assert_eq!((edge.start_column, edge.end_column), (0, 0));
+        assert!(graph.related("worker.rb", Direction::Callees, 1).direct.contains("company.rb"));
+    }
+
+    #[test]
+    fn loaded_association_targets_resolve_custom_model_names_with_loaded_provenance() {
+        let (baseline, graph, snapshot) = snapshot_graph(&[
+            ("application_record.rb", "class ApplicationRecord < ActiveRecord::Base; end"),
+            ("company.rb", "class Company < ApplicationRecord; def run; end; end"),
+            ("person.rb", "class Person < ApplicationRecord; belongs_to :employer; end"),
+            ("worker.rb", "class Worker; def perform; Person.find(1).employer.run; end; end"),
+        ], serde_json::json!([{"name":"Person","file":"person.rb","line":1,"ancestors":["Person","ApplicationRecord","ActiveRecord::Base"],"active_record":true,"attributes":["id"],"associations":[{"name":"employer","target":"Company","collection":false}],"methods":[]}]), serde_json::json!([]));
+        assert!(snapshot.warnings.is_empty());
+        assert!(!baseline.edges.iter().any(|edge| edge.callee.name == "Company#run"));
+        let edge = graph.edges.iter().find(|edge| edge.callee.name == "Company#run").unwrap();
+        assert_eq!(edge.evidence, EvidenceKind::Loaded);
+        assert!(edge.inference.as_deref().unwrap().contains("Loaded app association"));
+        assert!(!graph.edges.iter().any(|edge| edge.evidence == EvidenceKind::Observed));
+    }
+
+    #[test]
+    fn loaded_collection_types_keep_provenance_through_a_finder_and_compatible_return_paths() {
+        let (_, graph, _) = snapshot_graph(&[
+            ("application_record.rb", "class ApplicationRecord < ActiveRecord::Base; end"),
+            ("company.rb", "class Company < ApplicationRecord; def run; end; end"),
+            ("person.rb", "class Person < ApplicationRecord; has_many :employers; end"),
+            ("worker.rb", "class Worker; def company; return Person.find(1).employers.first if condition; Company.new; end; def perform; company.run; end; end"),
+        ], serde_json::json!([{"name":"Person","file":"person.rb","line":1,"ancestors":["Person","ApplicationRecord","ActiveRecord::Base"],"active_record":true,"attributes":[],"associations":[{"name":"employers","target":"Company","collection":true}],"methods":[]}]), serde_json::json!([]));
+        let edge = graph.edges.iter().find(|edge| edge.caller.name == "Worker#perform" && edge.callee.name == "Company#run").unwrap();
+        assert_eq!(edge.evidence, EvidenceKind::Loaded);
+        assert!(edge.inference.as_deref().unwrap().contains("Loaded app association"));
+    }
+
+    #[test]
+    fn loaded_model_ancestry_is_labeled_when_source_ancestry_is_unknown() {
+        let (baseline, graph, _) = snapshot_graph(&[
+            ("company.rb", "class Company < DynamicBase; def run; end; end"),
+            ("worker.rb", "class Worker; def perform; Company.find(1).run; end; end"),
+        ], serde_json::json!([{"name":"Company","file":"company.rb","line":1,"ancestors":["Company","ActiveRecord::Base"],"active_record":true,"attributes":[],"associations":[],"methods":[]}]), serde_json::json!([]));
+        assert!(!baseline.edges.iter().any(|edge| edge.callee.name == "Company#run"));
+        for name in ["Company.find", "Company#run"] {
+            let edge = graph.edges.iter().find(|edge| edge.callee.name == name).unwrap();
+            assert_eq!(edge.evidence, EvidenceKind::Loaded, "{name}");
+        }
+    }
+
+    #[test]
+    fn parse_error_class_reopenings_cannot_supply_loaded_methods_or_attributes() {
+        let (_, graph, snapshot) = snapshot_graph(&[
+            ("application_record.rb", "class ApplicationRecord < ActiveRecord::Base; end"),
+            ("company.rb", "class Company < ApplicationRecord; end"),
+            ("broken.rb", "class Company <"),
+            ("worker.rb", "class Worker; def perform; Company.find(1).only_loaded; end; end"),
+        ], serde_json::json!([{"name":"Company","file":"broken.rb","line":1,"ancestors":["Company","ActiveRecord::Base"],"active_record":true,"attributes":["only_loaded"],"associations":[],"methods":[]}]), serde_json::json!([]));
+        assert!(snapshot.warnings.is_empty());
+        assert_eq!(graph.parse_errors, 1);
+        assert!(!graph.symbols.iter().any(|symbol| symbol.file == "broken.rb"));
+        assert!(!graph.edges.iter().any(|edge| edge.callee.name == "Company#only_loaded"));
+    }
+
+    #[test]
+    fn loaded_effective_methods_use_the_defining_module_for_include_and_extend() {
+        for (keyword, singleton, call) in [("include", false, "Worker.new.same.run"), ("extend", true, "Worker.run")] {
+            let (baseline, graph, snapshot) = snapshot_graph(&[
+                ("extra.rb", "module Extra; def run; end; def same; self; end; end"),
+                ("worker.rb", &format!("class Worker; {keyword} Extra; end")),
+                ("entry.rb", &format!("class Entry; def self.perform; {call}; end; end")),
+            ], serde_json::json!([{"name":"Worker","file":"worker.rb","line":1,"ancestors":["Worker","Extra","Object"],"active_record":false,"attributes":[],"associations":[],"methods":[
+                {"name":"run","owner":"Extra","singleton":singleton,"file":"extra.rb","line":1,"definition_name":"Extra#run"},
+                {"name":"same","owner":"Extra","singleton":singleton,"file":"extra.rb","line":1,"definition_name":"Extra#same"}
+            ]}]), serde_json::json!([]));
+            assert!(snapshot.warnings.is_empty());
+            assert!(!baseline.edges.iter().any(|edge| edge.caller.file == "entry.rb" && edge.callee.name == "Extra#run"));
+            let edge = graph.edges.iter().find(|edge| edge.caller.file == "entry.rb" && edge.callee.name == "Extra#run").unwrap();
+            assert_eq!(edge.evidence, EvidenceKind::Loaded, "{keyword}");
+            assert_eq!(edge.callee.file, "extra.rb");
+        }
+    }
 
     fn graph(files: &[(&str, &str)]) -> Graph {
         Graph::build(&files.iter().map(|(path, text)| SourceFile { path: (*path).into(), text: (*text).into() }).collect::<Vec<_>>(), None)
