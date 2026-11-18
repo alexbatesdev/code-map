@@ -81,6 +81,9 @@ Loaded-app-assisted links remain candidate calls; they are not execution proof.
 **Capture Rails** explicitly runs `bin/rails runner` in development with Spring
 disabled. It does not attach to or require an already running web server. App
 dependencies must already be installed; megamap never installs them.
+Capture uses the viewer's Ruby environment and the sibling `megamap-capture`
+helper built by `cargo build --release --bins`. For an app managed by a container
+or version manager, export in that environment and import the snapshot.
 
 To export inside a different environment, such as a container, run from that
 application's root:

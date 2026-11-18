@@ -305,6 +305,7 @@ impl AppMain for App {
     }
 
     fn handle_event(&mut self, cx: &mut Cx, event: &Event) {
+        if matches!(event, Event::Shutdown | Event::WindowClosed(_)) { evidence_input::cancel_capture(); }
         self.match_event(cx, event);
         self.ui.handle_event(cx, event, &mut Scope::empty());
         let loading = self.ui.code_map(cx, ids!(map)).is_loading();
