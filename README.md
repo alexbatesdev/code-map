@@ -165,12 +165,24 @@ second and closes when you leave the control or interact with the app.
 
 | Input | Action |
 | --- | --- |
-| Scroll | Zoom |
+| Scroll over treemap | Zoom |
+| Scroll over File tree | Scroll the file list (Shift for horizontal) |
 | Drag | Pan |
 | Click | Inspect a file or folder |
 | Click a colored call | Jump to its definition |
 | Double click | Fly to it |
 | Enter in search | Next match |
+
+Enable **File tree** to open the expandable filesystem sidebar. Its folders and
+files share the treemap's filters, ignored-file toggle and relationship trace.
+Click an item to select it in the map and inspector; double-click a file to zoom
+to it, or a folder to expand/collapse it. Search and definition jumps reveal the
+selected file in the sidebar. Folder expansion survives filtering and hiding it.
+
+With the sidebar focused, Up/Down and Home/End select rows, Right/Left expand or
+collapse folders, and Enter centers the selected item in the treemap. Wheel or
+scrollbars move the list; Shift-wheel and horizontal trackpad motion scroll long
+names sideways. Large folders draw only rows in the viewport.
 
 ## Code tour
 
@@ -183,6 +195,7 @@ second and closes when you leave the control or interact with the app.
 | `src/map.rs`, `src/canvas.rs` | Map controller, drawing, zoom, picking and search |
 | `native/megamap.m`, `src/platform.rs` | AppKit window/input, Metal batches and CoreText glyph atlas |
 | `src/editor.rs` | Text selection, editing and composition |
+| `src/file_tree.rs` | Cached filesystem rows, folder expansion and selected-path reveal |
 
 The window currently supports macOS only. The `scan` binary and analysis modules
 remain portable; no Windows, Linux or web UI is provided.

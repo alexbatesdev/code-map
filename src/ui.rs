@@ -1,4 +1,5 @@
 use crate::{canvas::Canvas, editor::Editor, evidence_input::EvidenceInput, map::Map, model::{ColorMode, R}, platform::{self, Accessibility, AccessibilityRole, Backend, Cursor, Event, Quad}};
+use crate::file_tree::{FileTree, ROW_HEIGHT, is_folder};
 use serde_json::{json, Value};
 use std::{path::PathBuf, time::Instant};
 
@@ -16,7 +17,7 @@ impl Field {
 }
 
 #[derive(Clone, Debug)]
-enum Action { Field(Field), Button(&'static str), Toggle(&'static str), Drop(&'static str), Choose(&'static str, usize), None }
+enum Action { Field(Field), Button(&'static str), Toggle(&'static str), Drop(&'static str), Choose(&'static str, usize), TreePane, TreeRow(usize), TreeToggle(usize), TreeScrollbar(bool), None }
 
 #[derive(Clone)]
 struct Widget { id: String, ty: &'static str, rect: R, text: String, value: Option<String>, checked: Option<bool>, action: Action }
@@ -32,6 +33,12 @@ pub struct App {
     focus: Option<String>,
     pressed: Option<String>,
     editing_drag: bool,
+    pressed_clicks: u32,
+    tree_shown: bool,
+    file_tree: FileTree,
+    tree_rect: R,
+    tree_body: R,
+    tree_scroll_drag: Option<(bool, f64, f64)>,
     pointer: (f64, f64),
     tooltip_hover: Option<(String, Instant)>,
     tooltip_visible: bool,
@@ -55,7 +62,7 @@ impl App {
             map.set_evidence_input(EvidenceInput::File(path));
         }
         Ok(Self { map, running: true, width: 1400.0, height: 900.0, scale: 1.0, editors,
-            widgets: Vec::new(), focus: None, pressed: None, editing_drag: false, pointer: (0.0, 0.0), tooltip_hover: None, tooltip_visible: false,
+            widgets: Vec::new(), focus: None, pressed: None, editing_drag: false, pressed_clicks: 1, tree_shown: false, file_tree: FileTree::default(), tree_rect: R::default(), tree_body: R::default(), tree_scroll_drag: None, pointer: (0.0, 0.0), tooltip_hover: None, tooltip_visible: false,
             popup: None, map_rect: R::default(), inspector: R::default(), inspector_scroll: 0.0,
             inspector_limit: 0.0, detail_cache: None, buffer: None, local_status: None, started: Instant::now() })
     }
@@ -75,7 +82,7 @@ impl App {
     }
 
     fn update_tooltip_hover(&mut self) {
-        let target = if self.popup.is_none() && self.pressed.is_none() && !self.editing_drag {
+        let target = if self.popup.is_none() && self.pressed.is_none() && !self.editing_drag && self.tree_scroll_drag.is_none() {
             self.widgets.iter().rev().find(|widget| widget.rect.contains(self.pointer.0, self.pointer.1) && control_help(&widget.action).is_some()).map(|widget| widget.id.as_str())
         } else { None };
         if target != self.tooltip_hover.as_ref().map(|(id, _)| id.as_str()) {
@@ -91,7 +98,7 @@ impl App {
     fn layout(&mut self) {
         self.widgets.clear();
         let groups: &[&[(&str, f64)]] = &[
-            &[("search", 250.0), ("fit_button", 44.0), ("show_ignored", 126.0), ("syntax_colors", 130.0), ("color_mode", 160.0), ("hide_tests", 142.0)],
+            &[("search", 250.0), ("fit_button", 44.0), ("show_ignored", 126.0), ("syntax_colors", 130.0), ("color_mode", 160.0), ("hide_tests", 142.0), ("file_tree_toggle", 112.0)],
             &[("filter_query", 300.0), ("relationship_mode", 174.0), ("trace_selected", 136.0), ("relationship_depth", 90.0), ("evidence_mode", 180.0)],
             &[("evidence_path", 340.0), ("evidence_load", 114.0), ("evidence_capture", 114.0), ("evidence_clear", 92.0)],
         ];
@@ -112,6 +119,7 @@ impl App {
                     "evidence_load" => self.add(id, "Button", rect, "Load snapshot", None, None, Action::Button("evidence_load")),
                     "evidence_capture" => self.add(id, "Button", rect, "Capture Rails", None, None, Action::Button("evidence_capture")),
                     "evidence_clear" => self.add(id, "Button", rect, "Static only", None, None, Action::Button("evidence_clear")),
+                    "file_tree_toggle" => self.toggle(id, rect, "File tree", self.tree_shown),
                     "show_ignored" => self.toggle(id, rect, "Show ignored", self.map.show_ignored),
                     "syntax_colors" => self.toggle(id, rect, "Syntax colors", self.map.syntax_colors),
                     "hide_tests" => self.toggle(id, rect, "Hide specs/tests", self.map.hide_tests),
@@ -136,8 +144,11 @@ impl App {
         self.add("relationship_root", "Label", R { x: 8.0, y, w: (self.width - 16.0).max(1.0), h: 18.0 }, root, None, None, Action::None);
         let top = y + 22.0;
         let inspector_w = if self.width >= 900.0 { 340.0 } else { 260.0_f64.min(self.width * 0.45) };
-        self.map_rect = R { x: 0.0, y: top, w: (self.width - inspector_w).max(1.0), h: (self.height - top - 28.0).max(1.0) };
-        self.inspector = R { x: self.map_rect.w, y: top, w: inspector_w, h: self.map_rect.h };
+        let tree_w = if self.tree_shown { (self.width * 0.24).clamp(150.0, 300.0) } else { 0.0 };
+        self.tree_rect = R { x: 0.0, y: top, w: tree_w, h: (self.height - top - 28.0).max(1.0) };
+        self.tree_body = R { x: 0.0, y: top+28.0, w: (tree_w-10.0).max(1.0), h: (self.tree_rect.h-38.0).max(1.0) };
+        self.map_rect = R { x: tree_w, y: top, w: (self.width - inspector_w - tree_w).max(1.0), h: self.tree_rect.h };
+        self.inspector = R { x: self.map_rect.x+self.map_rect.w, y: top, w: inspector_w, h: self.map_rect.h };
     }
 
     fn field(&mut self, field: Field, rect: R, placeholder: &str) {
@@ -240,16 +251,98 @@ impl App {
             if !self.map.has_link_at(link.rect.x+link.rect.w*0.5, link.rect.y+link.rect.h*0.5) { continue; }
             self.widgets.push(Widget { id: format!("call_{i}"), ty: "CallLink", rect: link.rect, text: format!("{} at {}:{} · {}", link.target.definition.name, link.target.definition.file, link.target.definition.line, link.target.evidence.label()), value: None, checked: None, action: Action::None });
         }
+        self.draw_file_tree(backend, screen);
         self.draw_popup(backend, screen);
         self.draw_tooltip(backend, screen);
         self.sync_input(backend);
         let elements: Vec<_> = self.widgets.iter().filter(|widget| !matches!(widget.action, Action::None)).map(|widget| Accessibility {
             id: id_hash(&widget.id), role: match widget.ty { "TextInput" => AccessibilityRole::Text, "CheckBox" => AccessibilityRole::CheckBox, "DropDown" => AccessibilityRole::Popup, _ => AccessibilityRole::Button },
-            enabled: true, focused: self.focus.as_deref() == Some(&widget.id), rect: [widget.rect.x,widget.rect.y,widget.rect.w,widget.rect.h], label: &widget.text,
+            enabled: true, focused: self.focus.as_deref() == Some(&widget.id) || (self.focus.as_deref() == Some("file_tree") && matches!(widget.action, Action::TreeRow(i) if Some(i) == self.file_tree.focus)), rect: [widget.rect.x,widget.rect.y,widget.rect.w,widget.rect.h], label: &widget.text,
             value: widget.value.as_deref().unwrap_or(if widget.checked == Some(true) { "1" } else { "0" }),
         }).collect();
         backend.accessibility(&elements);
         drops
+    }
+
+    fn tree_content_width(&self) -> f64 { self.file_tree.content_width }
+
+    fn browse_select(&mut self, index: usize, double: bool) {
+        self.file_tree.focus = Some(index);
+        if double && is_folder(self.map.tree().nodes[index].kind) { self.file_tree.toggle(self.map.tree(), index); }
+        self.map.select_node(index, double && !is_folder(self.map.tree().nodes[index].kind));
+        self.map.read_ignored_node(index);
+    }
+
+    fn tree_key(&mut self, code: u32) {
+        let current = self.file_tree.focus.or(self.file_tree.rows.first().copied());
+        let target = match code {
+            platform::KEY_DOWN => self.file_tree.adjacent(1),
+            platform::KEY_UP => self.file_tree.adjacent(-1),
+            platform::KEY_HOME => self.file_tree.rows.first().copied(),
+            platform::KEY_END => self.file_tree.rows.last().copied(),
+            platform::KEY_LEFT => current.and_then(|i| {
+                if is_folder(self.map.tree().nodes[i].kind) && self.file_tree.is_expanded(self.map.tree(),i) { self.file_tree.toggle(self.map.tree(),i); None }
+                else { self.map.tree().nodes[i].parent }
+            }),
+            platform::KEY_RIGHT => current.and_then(|i| {
+                if !is_folder(self.map.tree().nodes[i].kind) { return None; }
+                if !self.file_tree.is_expanded(self.map.tree(),i) {
+                    self.map.read_ignored_node(i);
+                    self.file_tree.toggle(self.map.tree(),i);
+                    None
+                } else { self.file_tree.rows.iter().position(|&index| index == i).and_then(|row| self.file_tree.rows.get(row+1)).copied().filter(|&child| self.map.tree().nodes[child].parent == Some(i)) }
+            }),
+            platform::KEY_RETURN => { if let Some(i)=current { self.map.select_node(i,true); self.map.read_ignored_node(i); } None },
+            _ => None,
+        };
+        if let Some(index)=target { self.map.select_node(index,false); self.file_tree.focus=Some(index); self.file_tree.reveal_pending=true; }
+    }
+
+    fn draw_file_tree(&mut self, backend: &mut Backend, screen: R) {
+        if !self.tree_shown { return; }
+        self.file_tree.sync(self.map.tree(), self.map.tree_revision(), self.map.selected_node(), self.map.selection_revision());
+        let range = self.file_tree.visible_range(self.map.tree(), self.tree_body.w, self.tree_body.h);
+        let max_x = (self.tree_content_width()-self.tree_body.w).max(0.0);
+        self.file_tree.scroll_x = self.file_tree.scroll_x.clamp(0.0,max_x);
+        let mut widgets = Vec::new();
+        let mut canvas = Canvas::with_buffer(backend,self.buffer.take().unwrap_or_default());
+        canvas.rect(self.tree_rect,[0.06,0.075,0.09,1.0],EDGE,1.0,0.0,screen);
+        canvas.text("FILES",8.0,self.tree_rect.y+7.0,FONT,TEXT,self.tree_rect,true);
+        self.widgets.push(Widget { id:"file_tree".into(), ty:"FileTree", rect:self.tree_body, text:"Files".into(),value:None,checked:None,action:Action::TreePane });
+        for row in range {
+            let index = self.file_tree.rows[row];
+            let node = &self.map.tree().nodes[index];
+            let y = self.tree_body.y + row as f64*ROW_HEIGHT-self.file_tree.scroll_y;
+            let row_rect=R{x:0.0,y,w:self.tree_body.w,h:ROW_HEIGHT};
+            let Some(hit) = crate::math::intersection(row_rect,self.tree_body) else { continue };
+            let selected = self.map.selected_node()==Some(index);
+            let focused = self.focus.as_deref()==Some("file_tree") && self.file_tree.focus==Some(index);
+            if selected || focused { canvas.rect(row_rect,if selected {[0.12,0.27,0.36,1.0]}else{[0.11,0.15,0.18,1.0]},if focused{ACCENT}else{[0.0;4]},if focused{1.0}else{0.0},0.0,self.tree_body); }
+            let x=8.0+node.depth as f64*16.0-self.file_tree.scroll_x;
+            let folder=is_folder(node.kind);
+            widgets.push(Widget{id:format!("tree_row_{index}"),ty:"TreeRow",rect:hit,text:node.name.clone(),value:Some(node.path.clone()),checked:Some(selected),action:Action::TreeRow(index)});
+            if folder {
+                let disclosure=R{x,y,w:18.0,h:ROW_HEIGHT};
+                canvas.text(if self.file_tree.is_expanded(self.map.tree(),index){"v"}else{">"},x+2.0,y+4.0,FONT,MUTED,self.tree_body,true);
+                if let Some(rect)=crate::math::intersection(disclosure,self.tree_body) { widgets.push(Widget{id:format!("tree_toggle_{index}"),ty:"TreeDisclosure",rect,text:format!("Toggle {}",node.name),value:Some(node.path.clone()),checked:Some(self.file_tree.is_expanded(self.map.tree(),index)),action:Action::TreeToggle(index)}); }
+            } else { canvas.rect(R{x:x+5.0,y:y+8.0,w:6.0,h:7.0},self.map.file_color(index),[0.0;4],0.0,0.0,self.tree_body); }
+            let suffix=if matches!(node.kind,crate::model::Kind::Ghost{loading:true,..}){" [loading]"}else if node.ignored{" [ignored]"}else{""};
+            let color=if node.ignored { MUTED } else if !self.editors[0].text.is_empty() && node.lit { [1.0,0.8,0.32,1.0] } else {TEXT};
+            canvas.text(&format!("{}{suffix}",node.name),x+21.0,y+4.0,FONT,color,self.tree_body,true);
+        }
+        if self.file_tree.rows.is_empty() {canvas.text(if self.map.loading(){"Scanning…"}else{"No matching files"},8.0,self.tree_body.y+8.0,FONT,MUTED,self.tree_body,true);}
+        for horizontal in [false,true] {
+            let (extent,viewport)=if horizontal {(self.tree_content_width(),self.tree_body.w)}else{(self.file_tree.rows.len() as f64*ROW_HEIGHT,self.tree_body.h)};
+            if extent<=viewport {continue;}
+            let offset=if horizontal {self.file_tree.scroll_x}else{self.file_tree.scroll_y};
+            let thumb=(viewport*viewport/extent).max(20.0).min(viewport);
+            let position=offset/(extent-viewport)*(viewport-thumb);
+            let rect=if horizontal{R{x:position,y:self.tree_body.y+self.tree_body.h+2.0,w:thumb,h:6.0}}else{R{x:self.tree_body.w+2.0,y:self.tree_body.y+position,w:6.0,h:thumb}};
+            canvas.rect(rect,[0.35,0.43,0.49,1.0],[0.0;4],0.0,0.0,self.tree_rect);
+            widgets.push(Widget{id:format!("tree_scroll_{}",if horizontal{"x"}else{"y"}),ty:"ScrollBar",rect,text:"Scroll files".into(),value:None,checked:None,action:Action::TreeScrollbar(horizontal)});
+        }
+        self.buffer=Some(canvas.into_buffer());
+        self.widgets.extend(widgets);
     }
 
     fn draw_popup(&mut self, backend: &mut Backend, screen: R) {
@@ -335,6 +428,7 @@ impl App {
                 "evidence_clear" => self.map.set_evidence_input(EvidenceInput::Static), _ => {}
             },
             Action::Toggle(id) => match id {
+                "file_tree_toggle" => { self.tree_shown = !self.tree_shown; if self.tree_shown { self.file_tree.reveal_pending = true; } else if self.focus.as_deref() == Some("file_tree") { self.set_focus(None,backend); } },
                 "show_ignored" => self.map.set_show_ignored(!self.map.show_ignored), "syntax_colors" => self.map.set_syntax_colors(!self.map.syntax_colors), "hide_tests" => self.map.set_hide_tests(!self.map.hide_tests), _ => {}
             },
             Action::Drop(id) => {
@@ -349,7 +443,13 @@ impl App {
                     "evidence_mode" => self.map.set_evidence_mode(index), _ => {}
                 }
             }
-            Action::None => {}
+            Action::TreePane => self.set_focus(Some("file_tree".into()), backend),
+            Action::TreeRow(index) => self.browse_select(index, false),
+            Action::TreeToggle(index) => {
+                self.map.read_ignored_node(index);
+                self.file_tree.toggle(self.map.tree(), index);
+            }
+            Action::TreeScrollbar(_) | Action::None => {}
         }
     }
 
@@ -381,7 +481,13 @@ impl App {
             Event::PointerMove {x,y,..} => {
                 self.pointer=(x,y);
                 self.update_tooltip_hover();
-                if self.editing_drag {
+                if let Some((horizontal, start, offset)) = self.tree_scroll_drag {
+                    let position = if horizontal { x } else { y };
+                    let (extent, viewport) = if horizontal { (self.tree_content_width(), self.tree_body.w) } else { (self.file_tree.rows.len() as f64*ROW_HEIGHT, self.tree_body.h) };
+                    let thumb=(viewport*viewport/extent.max(1.0)).max(20.0).min(viewport);
+                    let value = offset + (position-start) * ((extent-viewport).max(0.0)/(viewport-thumb).max(1.0));
+                    if horizontal { self.file_tree.scroll_x = value.max(0.0); } else { self.file_tree.scroll_y = value.max(0.0); }
+                } else if self.editing_drag {
                     if let Some(field)=self.focused_field() { self.caret_from_pointer(field,x,true,backend); }
                 } else { self.map.pointer_move(x,y); }
                 let cursor=if self.widgets.iter().any(|w|matches!(w.action,Action::Field(_))&&w.rect.contains(x,y)) { Cursor::Text }
@@ -394,8 +500,13 @@ impl App {
                 if button!=0 { self.map.pointer_down_with_modifiers(x,y,button,clicks,modifiers); return; }
                 let hit=self.widgets.iter().rev().find(|w|w.rect.contains(x,y)&&!matches!(w.action,Action::None)).cloned();
                 if let Some(widget)=hit {
-                    if !matches!(widget.action,Action::Choose(_,_)) { self.set_focus(Some(widget.id.clone()),backend); }
-                    if let Action::Field(field)=widget.action {
+                    if matches!(widget.action, Action::TreePane | Action::TreeRow(_) | Action::TreeToggle(_) | Action::TreeScrollbar(_)) { self.popup=None; self.set_focus(Some("file_tree".into()),backend); }
+                    else if !matches!(widget.action,Action::Choose(_,_)) { self.set_focus(Some(widget.id.clone()),backend); }
+                    if let Action::TreeScrollbar(horizontal) = widget.action {
+                        let position = if horizontal {x} else {y};
+                        let offset = if horizontal {self.file_tree.scroll_x} else {self.file_tree.scroll_y};
+                        self.tree_scroll_drag = Some((horizontal,position,offset));
+                    } else if let Action::Field(field)=widget.action {
                         self.popup=None;
                         if self.editors[field.index()].is_composing() {
                             if self.editors[field.index()].commit_composition().unwrap_or(false) { self.apply_field(field); }
@@ -404,22 +515,27 @@ impl App {
                         if clicks>=2 { self.editors[field.index()].select_all(); }
                         else { self.caret_from_pointer(field,x,modifiers&platform::SHIFT!=0,backend); }
                         self.editing_drag=true;
-                    } else { self.pressed=Some(widget.id); }
+                    } else { self.pressed=Some(widget.id); self.pressed_clicks=clicks; }
                 } else {
                     self.popup=None; self.set_focus(None,backend); self.map.pointer_down_with_modifiers(x,y,button,clicks,modifiers);
                 }
             }
             Event::PointerUp {x,y,button,..} => {
                 self.editing_drag=false;
+                self.tree_scroll_drag=None;
                 if button==0 {
                     if let Some(id)=self.pressed.take() {
-                        if let Some(action)=self.widgets.iter().rev().find(|w|w.id==id&&w.rect.contains(x,y)).map(|w|w.action.clone()) { self.activate(action,backend); }
+                        if let Some(action)=self.widgets.iter().rev().find(|w|w.id==id&&w.rect.contains(x,y)).map(|w|w.action.clone()) { if let Action::TreeRow(index) = action { self.browse_select(index, self.pressed_clicks>=2); } else { self.activate(action,backend); } }
                     }
                 }
                 self.map.pointer_up(x,y,button);
             }
-            Event::Scroll {x,y,dy,..} => {
-                if self.inspector.contains(x,y) { self.inspector_scroll=(self.inspector_scroll-dy).clamp(0.0,self.inspector_limit); }
+            Event::Scroll {x,y,dx,dy,modifiers} => {
+                if self.tree_shown && self.tree_rect.contains(x,y) && self.popup.is_none() {
+                    self.file_tree.scroll_x -= dx;
+                    if modifiers & platform::SHIFT != 0 { self.file_tree.scroll_x -= dy; }
+                    else { self.file_tree.scroll_y -= dy; }
+                } else if self.inspector.contains(x,y) { self.inspector_scroll=(self.inspector_scroll-dy).clamp(0.0,self.inspector_limit); }
                 else if self.popup.is_none() { self.map.scroll(x,y,-dy); }
             }
             Event::Text {text,replace_start,replace_len} => {
@@ -461,12 +577,16 @@ impl App {
             return;
         }
         if code==platform::KEY_TAB {
-            let focusable:Vec<_>=self.widgets.iter().filter(|w|!matches!(w.action,Action::None|Action::Choose(_,_))).map(|w|w.id.clone()).collect();
+            let focusable:Vec<_>=self.widgets.iter().filter(|w|!matches!(w.action,Action::None|Action::Choose(_,_)|Action::TreeRow(_)|Action::TreeToggle(_)|Action::TreeScrollbar(_))).map(|w|w.id.clone()).collect();
             if !focusable.is_empty() {
                 let current=focusable.iter().position(|id|Some(id.as_str())==self.focus.as_deref());
                 let next=if mods&platform::SHIFT!=0 {current.map_or(focusable.len()-1,|i|(i+focusable.len()-1)%focusable.len())} else {current.map_or(0,|i|(i+1)%focusable.len())};
                 self.set_focus(Some(focusable[next].clone()),backend);
             }
+            return;
+        }
+        if self.focus.as_deref() == Some("file_tree") && self.tree_shown {
+            self.tree_key(code);
             return;
         }
         let Some(field)=self.focused_field() else {
@@ -516,7 +636,7 @@ impl App {
         json!({"s":widgets})
     }
 
-    pub fn state(&self)->Value {json!({"app":"megamap","pid":std::process::id(),"w":[{"i":0,"t":"megamap","sz":[self.width,self.height],"px":[self.width*self.scale,self.height*self.scale],"dpi":self.scale}],"map":self.map.debug_snapshot()})}
+    pub fn state(&self)->Value {json!({"app":"megamap","pid":std::process::id(),"w":[{"i":0,"t":"megamap","sz":[self.width,self.height],"px":[self.width*self.scale,self.height*self.scale],"dpi":self.scale}],"map":self.map.debug_snapshot(),"file_tree":{"shown":self.tree_shown,"rows":self.file_tree.rows.len(),"rendered_rows":self.widgets.iter().filter(|w|w.ty=="TreeRow").count(),"scroll_x":self.file_tree.scroll_x,"scroll_y":self.file_tree.scroll_y}})}
 }
 
 fn inset(rect:R,x:f64,y:f64)->R {R{x:rect.x+x,y:rect.y+y,w:(rect.w-2.0*x).max(1.0),h:(rect.h-2.0*y).max(1.0)}}
@@ -555,9 +675,14 @@ fn control_help(action: &Action) -> Option<&'static str> {
     let id = match action {
         Action::Field(field) => field.id(),
         Action::Button(id) | Action::Toggle(id) | Action::Drop(id) | Action::Choose(id, _) => id,
+        Action::TreePane => return Some("Browse folders and files. Use arrow keys to navigate, Right/Left to expand or collapse, and Enter to center the selected item in the map."),
+        Action::TreeRow(_) => return Some("Select this item in the map and inspector. Double-click a file to zoom to it; double-click a folder to expand or collapse it."),
+        Action::TreeToggle(_) => return Some("Expand or collapse this folder. Ignored folders are read only when opened."),
+        Action::TreeScrollbar(_) => return Some("Drag to scroll the file tree. Use the wheel to scroll vertically, or Shift-wheel to scroll horizontally."),
         Action::None => return None,
     };
     Some(match id {
+        "file_tree_toggle" => "Show or hide the expandable filesystem tree beside the treemap. It shares filters and relationship traces; selecting files in either view keeps the inspector in sync.",
         "search" => "Find files and folders by name or path. Press Enter to fly to the next match; Escape clears the search. Command-F focuses this field.",
         "fit_button" => "Zoom out to fit the currently visible files in the window. Keeps your filters and trace selection.",
         "show_ignored" => "Show files and folders excluded by ignore rules. Ignored entries stay collapsed until you click them to read their contents.",

@@ -57,6 +57,8 @@ type TextRequest = (u64, usize, PathBuf, String, Option<Arc<String>>);
 pub struct Map {
     root: PathBuf,
     tree: Tree,
+    tree_revision: u64,
+    selection_revision: u64,
     pub show_ignored: bool,
     needs_layout: bool,
     needs_fit: bool,
@@ -114,7 +116,7 @@ impl Map {
 
     fn empty() -> Self {
         Self {
-            root: PathBuf::new(), tree: Tree::new("project"), show_ignored: DEFAULT_SHOW_IGNORED,
+            root: PathBuf::new(), tree: Tree::new("project"), tree_revision: 0, selection_revision: 0, show_ignored: DEFAULT_SHOW_IGNORED,
             needs_layout: true, needs_fit: true, source_anchor: None, view: Rect::default(), world: R::default(),
             cam_scale: 1.0, cam_off: DVec2::default(), flight: None, flight_tick: Instant::now(), drag: None,
             hover: None, selected: None, definition_focus: None, call_links: Vec::new(), label_rects: Vec::new(),
@@ -139,6 +141,16 @@ impl Map {
     pub fn evidence_status(&self) -> &str { &self.evidence_status }
     pub fn relationship_root(&self) -> Option<&str> { self.relationship_root.as_deref() }
     pub fn selection_info(&self) -> Option<NodeInfo> { self.selected.map(|index| self.info(index)) }
+    pub fn tree(&self) -> &Tree { &self.tree }
+    pub fn tree_revision(&self) -> u64 { self.tree_revision }
+    pub fn selection_revision(&self) -> u64 { self.selection_revision }
+    pub fn selected_node(&self) -> Option<usize> { self.selected }
+    pub fn select_node(&mut self, index: usize, fly: bool) {
+        if !self.tree.is_visible(index) { return; }
+        self.select(index);
+        if fly { self.fly_to_node(index); }
+    }
+    pub fn read_ignored_node(&mut self, index: usize) { if self.tree.is_visible(index) { self.expand(index); } }
     pub fn links(&self) -> &[CallLink] { &self.call_links }
     pub fn has_link_at(&self, x: f64, y: f64) -> bool { self.call_at(dvec2(x, y)).is_some() }
     pub fn debug_snapshot(&self) -> serde_json::Value {
@@ -156,6 +168,8 @@ impl Map {
     pub fn open(&mut self, root: PathBuf) {
         let name = root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| root.display().to_string());
         self.tree = Tree::new(&name);
+        self.tree_revision = self.tree_revision.wrapping_add(1);
+        self.selection_revision = self.selection_revision.wrapping_add(1);
         self.root = root.clone();
         self.selected = None;
         self.definition_focus = None;
@@ -352,6 +366,7 @@ impl Map {
     }
 
     fn apply_selection(&mut self, view: ViewUpdate) {
+        self.tree_revision = self.tree_revision.wrapping_add(1);
         let weights: Vec<_> = if view == ViewUpdate::Preserve {
             self.tree.nodes.iter().map(|node| node.weight).collect()
         } else { Vec::new() };
@@ -384,6 +399,7 @@ impl Map {
                     anchor.y = 0.5;
                     anchor.screen = self.view.size * 0.5;
                     self.selected = Some(index);
+                    self.selection_revision = self.selection_revision.wrapping_add(1);
                 }
             }
         }
@@ -454,6 +470,7 @@ impl Map {
             self.set_status(self.summary());
         }
         self.selected = Some(index);
+        self.selection_revision = self.selection_revision.wrapping_add(1);
         self.dirty = true;
     }
 
@@ -473,6 +490,7 @@ impl Map {
         self.flight = Some(definition_camera(line, source.indent as usize, source.len as usize, self.view.size));
         self.definition_focus = Some(target.clone());
         self.selected = Some(index);
+        self.selection_revision = self.selection_revision.wrapping_add(1);
         self.ensure_text(index);
         self.set_status(format!("{} · {}", self.summary(), target_description(&target)));
         self.dirty = true;
@@ -534,6 +552,7 @@ impl Map {
                     for entry in project.entries {
                         self.tree.insert(entry);
                     }
+                    self.tree_revision = self.tree_revision.wrapping_add(1);
                     self.tree.update_weights(self.show_ignored);
                     self.tree.apply_filter(&self.filter, self.hide_tests, None);
                     let text = format!(
@@ -565,6 +584,7 @@ impl Map {
                         self.tree.graft(index, entries);
                         self.after_tree_change();
                         self.selected = Some(index);
+                        self.selection_revision = self.selection_revision.wrapping_add(1);
                         self.set_status(format!("Read ignored {path}: {} files", fmt_num(count as u64)));
                     }
                 }
@@ -600,6 +620,7 @@ impl Map {
     }
 
     fn after_tree_change(&mut self) {
+        self.tree_revision = self.tree_revision.wrapping_add(1);
         self.needs_layout = true;
         if let Some(history) = &self.history {
             self.tree.apply_history(history);
@@ -751,7 +772,7 @@ impl Map {
         !self.search.is_empty()
     }
 
-    fn file_color(&self, index: usize) -> Vec4f {
+    pub fn file_color(&self, index: usize) -> Vec4f {
         let node = &self.tree.nodes[index];
         if self.reachable.is_some() && node.is_file() {
             let [r, g, b] = call_colors::file_rgb(&node.path, self.relationship_root.as_deref());
