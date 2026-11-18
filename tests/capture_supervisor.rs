@@ -7,7 +7,8 @@ fn binary() -> PathBuf {
         .or_else(|| std::env::var_os("MEGAMAP_CAPTURE_TEST_BINARY").map(PathBuf::from)).expect("capture binary")
 }
 fn directory() -> PathBuf {
-    let path = std::env::temp_dir().join(format!("spamton-capture-test-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let path = std::env::temp_dir().join(format!("spamton-capture-test-{}-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(), NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
     fs::create_dir(&path).unwrap(); path
 }
 fn wait_for(path: &Path) -> String {
