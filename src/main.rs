@@ -1,14 +1,17 @@
-//! Code Map: fly over a codebase as a zoomable GPU treemap.
+//! megamap: fly over a codebase as a zoomable GPU treemap.
 //!
-//!   cargo run --release -- /path/to/project [--3d]
+//!   cargo run --release -- /path/to/project
 //!   cargo run --release --bin scan -- /path/to/project   (no window, just stats)
 
 pub use makepad_widgets;
 
 mod history;
+mod call_colors;
+mod filter;
+mod relationships;
+mod syntax;
 mod map_view;
 mod model;
-mod orbit;
 mod scan;
 
 use makepad_widgets::*;
@@ -30,8 +33,16 @@ script_mod! {
     startup() do #(App::script_component(vm)){
         ui: Root{
             main_window := Window{
+                window.title: "megamap"
+                window.app_id: "megamap"
                 window.inner_size: vec2(1400, 900)
                 pass.clear_color: #x07090c
+                window_menu +: {
+                    app_menu +: {name: "megamap"}
+                    about +: {name: "About megamap"}
+                    quit +: {name: "Quit megamap"}
+                    help_about +: {name: "megamap Help"}
+                }
                 body +: {
                     flow: Down
                     toolbar := View{
@@ -42,7 +53,8 @@ script_mod! {
                         show_bg: true
                         draw_bg +: {color: #x12161c}
                         title := Label{
-                            text: "Code Map"
+                            width: Fill
+                            text: "megamap"
                             draw_text +: {color: #xffffff text_style +: {font_size: 10.0}}
                         }
                         search := TextInput{
@@ -53,21 +65,47 @@ script_mod! {
                             width: 150
                             labels: ["File type" "Recently changed" "Most changed"]
                         }
-                        three_d := CheckBox{text: "3D" active: false}
                         fit_button := Button{text: "Fit"}
-                        show_ignored := CheckBox{text: "Show ignored" active: true}
-                        status := Label{
-                            width: Fill
-                            text: ""
-                            draw_text +: {color: #x8a949e text_style +: {font_size: 9.0}}
+                        show_ignored := CheckBox{text: "Show ignored" active: #(map_view::DEFAULT_SHOW_IGNORED)}
+                        syntax_colors := CheckBox{text: "Syntax colors" active: #(map_view::DEFAULT_SYNTAX_COLORS)}
+                    }
+                    filters := View{
+                        width: Fill height: 38
+                        flow: Right spacing: 12
+                        padding: Inset{left: 12, right: 12}
+                        align: Align{y: 0.5}
+                        Label{text: "Filter"}
+                        filter_query := TextInput{
+                            width: 420 height: 28
+                            empty_text: "app/ | webpack/ -**/*.spec.ts"
                         }
+                        hide_tests := CheckBox{text: "Hide specs / tests" active: false}
+                        InfoLabel{width: Fill text: "Spaces: AND   |: OR   -term: exclude   *: wildcard"}
+                    }
+                    relationships := View{
+                        width: Fill height: 38
+                        flow: Right spacing: 12
+                        padding: Inset{left: 12, right: 12}
+                        align: Align{y: 0.5}
+                        relationship_mode := DropDown{
+                            width: 175
+                            labels: ["All files" "Calls from root" "Callers of root"]
+                        }
+                        trace_selected := Button{text: "Trace selected file"}
+                        Label{text: "Call depth"}
+                        relationship_depth := DropDown{
+                            width: 80
+                            labels: ["1" "2" "3" "5" "8"]
+                        }
+                        relationship_root := InfoLabel{width: Fill text: "Select a source file to trace its calls"}
+                        InfoLabel{text: "Call colors match files · Click a call to jump"}
                     }
                     View{
                         width: Fill height: Fill
                         flow: Right
                         map := CodeMap{}
                         inspector := View{
-                            width: 290 height: Fill
+                            width: 340 height: Fill
                             flow: Down spacing: 8
                             padding: Inset{left: 14, right: 14, top: 14, bottom: 14}
                             show_bg: true
@@ -82,10 +120,49 @@ script_mod! {
                                 draw_text +: {color: #xffffff text_style +: {font_size: 11.0}}
                             }
                             info_path := InfoLabel{text: ""}
-                            info_details := InfoLabel{text: ""}
-                            View{width: Fill height: Fill}
+                            ScrollYView{
+                                width: Fill height: Fill
+                                info_details := InfoLabel{text: ""}
+                            }
                             InfoLabel{
-                                text: "Scroll: zoom\nDrag: pan (2D) or orbit (3D)\nShift or right drag: pan (3D)\nClick: inspect\nDouble click: fly to it\nEnter in search: next match\nStriped boxes are ignored by git.\nClick one to read it."
+                                text: "Scroll: zoom\nDrag: pan\nClick: inspect\nColored call: jump to definition\nDouble click: fly to it\nEnter in search: next match\nStriped boxes are ignored by git.\nClick one to read it."
+                            }
+                        }
+                    }
+                    View{
+                        width: Fill height: 26
+                        flow: Right
+                        padding: Inset{right: 12}
+                        status := Label{
+                            width: Fill height: Fill
+                            text: ""
+                            padding: Inset{left: 12, right: 12, top: 6}
+                            draw_text +: {color: #x8a949e text_style +: {font_size: 9.0}}
+                        }
+                        loading_indicator := LoadingSpinner{
+                            width: 28 height: 26
+                            visible: false
+                            draw_bg +: {
+                                pixel: fn() {
+                                    let sdf = Sdf2d.viewport(self.pos * vec2(32.0, 28.0))
+                                    let pulse = 0.65 + 0.35 * sin(self.draw_pass.time * 4.18879)
+                                    let gold = vec4(1.0, 0.78, 0.22, pulse)
+                                    sdf.move_to(16.0, 1.0)
+                                    sdf.line_to(23.0, 13.0)
+                                    sdf.line_to(9.0, 13.0)
+                                    sdf.close_path()
+                                    sdf.fill(gold)
+                                    sdf.move_to(8.0, 14.0)
+                                    sdf.line_to(15.0, 26.0)
+                                    sdf.line_to(1.0, 26.0)
+                                    sdf.close_path()
+                                    sdf.fill(gold)
+                                    sdf.move_to(24.0, 14.0)
+                                    sdf.line_to(31.0, 26.0)
+                                    sdf.line_to(17.0, 26.0)
+                                    sdf.close_path()
+                                    return sdf.fill(gold)
+                                }
                             }
                         }
                     }
@@ -111,13 +188,9 @@ fn project_path() -> PathBuf {
 impl MatchEvent for App {
     fn handle_startup(&mut self, cx: &mut Cx) {
         let path = project_path();
-        self.ui.label(cx, ids!(title)).set_text(cx, &format!("Code Map: {}", path.display()));
+        self.ui.label(cx, ids!(title)).set_text(cx, &format!("megamap: {}", path.display()));
         let map = self.ui.code_map(cx, ids!(map));
         map.open(cx, path);
-        if std::env::args().any(|a| a == "--3d") {
-            self.ui.check_box(cx, ids!(three_d)).set_active(cx, true, Animate::No);
-            map.set_3d(cx, true);
-        }
     }
 
     fn handle_actions(&mut self, cx: &mut Cx, actions: &Actions) {
@@ -128,8 +201,23 @@ impl MatchEvent for App {
         if let Some(show) = self.ui.check_box(cx, ids!(show_ignored)).changed(actions) {
             map.set_show_ignored(cx, show);
         }
-        if let Some(on) = self.ui.check_box(cx, ids!(three_d)).changed(actions) {
-            map.set_3d(cx, on);
+        if let Some(query) = self.ui.text_input(cx, ids!(filter_query)).changed(actions) {
+            map.set_filter(cx, &query);
+        }
+        if let Some(hide) = self.ui.check_box(cx, ids!(hide_tests)).changed(actions) {
+            map.set_hide_tests(cx, hide);
+        }
+        if let Some(on) = self.ui.check_box(cx, ids!(syntax_colors)).changed(actions) {
+            map.set_syntax_colors(cx, on);
+        }
+        if let Some(mode) = self.ui.drop_down(cx, ids!(relationship_mode)).changed(actions) {
+            map.set_relationship_mode(cx, mode);
+        }
+        if let Some(depth) = self.ui.drop_down(cx, ids!(relationship_depth)).changed(actions) {
+            map.set_relationship_depth(cx, [1, 2, 3, 5, 8][depth.min(4)]);
+        }
+        if self.ui.button(cx, ids!(trace_selected)).clicked(actions) {
+            map.trace_selected(cx);
         }
         if let Some(index) = self.ui.drop_down(cx, ids!(color_mode)).changed(actions) {
             let mode = match index {
@@ -159,6 +247,10 @@ impl MatchEvent for App {
             }
             match wa.cast::<CodeMapAction>() {
                 CodeMapAction::Status(text) => self.ui.label(cx, ids!(status)).set_text(cx, &text),
+                CodeMapAction::Root(text, mode) => {
+                    self.ui.label(cx, ids!(relationship_root)).set_text(cx, &text);
+                    self.ui.drop_down(cx, ids!(relationship_mode)).set_selected_item(cx, mode);
+                }
                 CodeMapAction::Selected(info) => {
                     self.ui.label(cx, ids!(info_title)).set_text(cx, &info.title);
                     self.ui.label(cx, ids!(info_path)).set_text(cx, &info.path);
@@ -180,5 +272,11 @@ impl AppMain for App {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event) {
         self.match_event(cx, event);
         self.ui.handle_event(cx, event, &mut Scope::empty());
+        let loading = self.ui.code_map(cx, ids!(map)).is_loading();
+        let indicator = self.ui.view(cx, ids!(loading_indicator));
+        indicator.set_visible(cx, loading);
+        if loading && matches!(event, Event::NextFrame(_)) {
+            indicator.redraw(cx);
+        }
     }
 }

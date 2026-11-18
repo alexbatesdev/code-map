@@ -6,9 +6,10 @@
 //! ownership rules with, and a child always has a bigger index than its
 //! parent, so walking the Vec backwards visits children before parents.
 
+use crate::filter::{is_test_path, Filter};
 use crate::history::History;
 use crate::scan::{Entry, EntryKind, Line};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct R {
@@ -76,6 +77,10 @@ pub enum ColorMode {
 pub struct Tree {
     pub nodes: Vec<Node>,
     by_path: HashMap<String, usize>,
+    filter: Filter,
+    hide_tests: bool,
+    relationship_paths: Option<HashSet<String>>,
+    show_ignored: bool,
 }
 
 impl Node {
@@ -107,6 +112,19 @@ impl Node {
     pub fn is_file(&self) -> bool {
         matches!(self.kind, Kind::Text | Kind::Binary)
     }
+
+    pub fn code_line_rect(&self, line: usize) -> Option<R> {
+        let index = line.checked_sub(1).filter(|&i| i < self.lines.len())?;
+        if self.kind != Kind::Text || self.line_h <= 0.0 { return None; }
+        let rows = self.lines.len().div_ceil(self.cols.max(1) as usize);
+        let inner = code_inner(self.rect);
+        Some(R {
+            x: inner.x + (index / rows) as f64 * COL_CHARS * CHAR_W * self.line_h,
+            y: inner.y + (index % rows) as f64 * self.line_h,
+            w: COL_CHARS * CHAR_W * self.line_h,
+            h: self.line_h,
+        })
+    }
 }
 
 impl Default for Tree {
@@ -118,7 +136,14 @@ impl Default for Tree {
 impl Tree {
     pub fn new(root_name: &str) -> Self {
         let root = Node::new(root_name.to_string(), String::new(), None, 0, false);
-        Tree { nodes: vec![root], by_path: HashMap::from([(String::new(), 0)]) }
+        Tree {
+            nodes: vec![root],
+            by_path: HashMap::from([(String::new(), 0)]),
+            filter: Filter::default(),
+            hide_tests: false,
+            relationship_paths: None,
+            show_ignored: false,
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -127,6 +152,10 @@ impl Tree {
 
     pub fn find(&self, path: &str) -> Option<usize> {
         self.by_path.get(path).copied()
+    }
+
+    pub fn is_visible(&self, index: usize) -> bool {
+        self.nodes.get(index).is_some_and(|node| node.weight > 0.0)
     }
 
     /// Add an entry, creating its parent folders on the way.
@@ -195,7 +224,41 @@ impl Tree {
 
     /// Recompute totals and treemap weights, bottom up.
     pub fn update_weights(&mut self, show_ignored: bool) {
+        self.show_ignored = show_ignored;
+        self.recompute_weights();
+    }
+
+    /// Filter leaves while retaining their ancestors and stable node indices.
+    pub fn apply_filter(&mut self, filter: &Filter, hide_tests: bool, relationship_paths: Option<&HashSet<String>>) {
+        self.filter = filter.clone();
+        self.hide_tests = hide_tests;
+        self.relationship_paths = relationship_paths.cloned();
+        self.recompute_weights();
+    }
+
+    fn recompute_weights(&mut self) {
+        let mut allowed = vec![true; self.nodes.len()];
+        for i in 0..self.nodes.len() {
+            let node = &self.nodes[i];
+            let parent_allowed = node.parent.is_none_or(|parent| allowed[parent]);
+            allowed[i] = parent_allowed && (self.show_ignored || !node.ignored);
+            if node.kind != Kind::Dir {
+                allowed[i] &= self.filter.matches(&node.path)
+                    && (!self.hide_tests || !is_test_path(&node.path))
+                    && self.relationship_paths.as_ref().is_none_or(|paths| paths.contains(&node.path));
+            }
+        }
         for i in (0..self.nodes.len()).rev() {
+            if !allowed[i] {
+                let node = &mut self.nodes[i];
+                node.total_lines = 0;
+                node.total_files = 0;
+                node.weight = 0.0;
+                if node.kind == Kind::Dir {
+                    node.bytes = 0;
+                }
+                continue;
+            }
             let (weight, lines, files, bytes) = match self.nodes[i].kind {
                 Kind::Text => {
                     let n = self.nodes[i].lines.len() as u64;
@@ -210,20 +273,22 @@ impl Tree {
                     let mut ghosts = 0;
                     for &c in &self.nodes[i].children {
                         let child = &self.nodes[c];
-                        if matches!(child.kind, Kind::Ghost { .. }) {
+                        if matches!(child.kind, Kind::Ghost { .. }) && allowed[c] {
                             ghosts += 1;
-                        } else if show_ignored || !child.ignored {
+                        } else {
                             weight += child.weight;
                         }
                         lines += child.total_lines;
                         files += child.total_files;
-                        bytes += child.bytes;
+                        if child.weight > 0.0 {
+                            bytes += child.bytes;
+                        }
                     }
                     // Unread ignored things get a small token size: big enough to
                     // see and click, small enough not to distort the map.
-                    let ghost_weight = if show_ignored && ghosts > 0 { (weight * 0.02).max(3.0) } else { 0.0 };
+                    let ghost_weight = if self.show_ignored && ghosts > 0 { (weight * 0.02).max(3.0) } else { 0.0 };
                     for c in self.nodes[i].children.clone() {
-                        if matches!(self.nodes[c].kind, Kind::Ghost { .. }) {
+                        if matches!(self.nodes[c].kind, Kind::Ghost { .. }) && allowed[c] {
                             self.nodes[c].weight = ghost_weight;
                             weight += ghost_weight;
                         }
@@ -237,12 +302,28 @@ impl Tree {
             if node.kind == Kind::Dir {
                 node.bytes = bytes;
             }
-            node.weight = if !show_ignored && node.ignored { 0.0 } else { weight };
+            node.weight = weight;
+        }
+        for node in &mut self.nodes {
+            if node.weight <= 0.0 {
+                node.rect = R::default();
+                node.cols = 0;
+                node.line_h = 0.0;
+                node.lit = false;
+                node.on_path = false;
+            }
         }
     }
 
     pub fn layout(&mut self, world: R) {
-        self.layout_node(0, world);
+        for node in &mut self.nodes {
+            node.rect = R::default();
+            node.cols = 0;
+            node.line_h = 0.0;
+        }
+        if self.nodes[0].weight > 0.0 {
+            self.layout_node(0, world);
+        }
     }
 
     fn layout_node(&mut self, index: usize, r: R) {
@@ -327,20 +408,21 @@ impl Tree {
         let words: Vec<String> = query.split_whitespace().map(|w| w.to_lowercase()).collect();
         if words.is_empty() {
             for node in &mut self.nodes {
-                node.lit = true;
-                node.on_path = true;
+                node.lit = node.weight > 0.0;
+                node.on_path = node.lit;
             }
             return Vec::new();
         }
         let mut matches = Vec::new();
         for i in 0..self.nodes.len() {
             let path = self.nodes[i].path.to_lowercase();
-            let hit = i > 0 && words.iter().all(|w| path.contains(w.as_str()));
+            let visible = self.nodes[i].weight > 0.0;
+            let hit = visible && i > 0 && words.iter().all(|w| path.contains(w.as_str()));
             if hit {
                 matches.push(i);
             }
             let parent_lit = self.nodes[i].parent.is_some_and(|p| self.nodes[p].lit);
-            self.nodes[i].lit = hit || parent_lit;
+            self.nodes[i].lit = visible && (hit || parent_lit);
             self.nodes[i].on_path = self.nodes[i].lit;
         }
         for i in (1..self.nodes.len()).rev() {
@@ -356,20 +438,9 @@ impl Tree {
         matches
     }
 
-    /// The top-level folder a node lives in (for coloring regions in 3D).
-    pub fn top_level(&self, mut index: usize) -> usize {
-        while let Some(parent) = self.nodes[index].parent {
-            if parent == 0 {
-                return index;
-            }
-            index = parent;
-        }
-        index
-    }
-
     /// The deepest laid-out node under a world point.
     pub fn hit(&self, x: f64, y: f64, min_size: f64) -> Option<usize> {
-        if !self.nodes[0].rect.contains(x, y) {
+        if self.nodes[0].weight <= 0.0 || !self.nodes[0].rect.contains(x, y) {
             return None;
         }
         let mut at = 0;
@@ -474,4 +545,151 @@ fn worst(row: &[f64], side: f64) -> f64 {
     let min = row.iter().cloned().fold(f64::INFINITY, f64::min);
     let s2 = side * side;
     (s2 * max / (sum * sum)).max(sum * sum / (s2 * min))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn file(path: &str, lines: usize, ignored: bool) -> Entry {
+        Entry { path: path.into(), kind: EntryKind::Text { bytes: lines as u64 * 10, lines: vec![Line::default(); lines] }, ignored }
+    }
+
+    #[test]
+    fn definition_lines_follow_source_columns_and_reject_missing_lines() {
+        let mut tree = Tree::new("project");
+        tree.insert(file("many.rb", 3108, false));
+        tree.update_weights(false);
+        tree.layout(R { x: 0.0, y: 0.0, w: 1000.0, h: 700.0 });
+        let node = &tree.nodes[tree.find("many.rb").unwrap()];
+        let first = node.code_line_rect(1).unwrap();
+        let rows = node.lines.len().div_ceil(node.cols as usize);
+        assert!(node.cols > 1);
+        let next_column = node.code_line_rect(rows + 1).unwrap();
+        assert_eq!(first.y, next_column.y);
+        assert!((next_column.x - first.x - first.w).abs() < 1e-8);
+        assert!(node.code_line_rect(3104).is_some());
+        assert!(node.code_line_rect(0).is_none());
+        assert!(node.code_line_rect(3109).is_none());
+        assert!(tree.nodes[0].code_line_rect(1).is_none());
+    }
+
+    #[test]
+    fn hidden_ignored_files_are_absent_from_totals_and_search() {
+        let mut tree = Tree::new("project");
+        tree.insert(file("app/user.rb", 10, false));
+        tree.insert(file("vendor/hidden.rb", 30, true));
+        tree.update_weights(false);
+        assert_eq!(tree.nodes[0].total_files, 1);
+        assert_eq!(tree.nodes[0].total_lines, 10);
+        assert_eq!(tree.nodes[0].bytes, 100);
+        assert!(tree.search("hidden").is_empty());
+        tree.update_weights(true);
+        assert_eq!(tree.nodes[0].total_files, 2);
+        assert_eq!(tree.nodes[0].total_lines, 40);
+        assert_eq!(tree.nodes[0].bytes, 400);
+    }
+
+    #[test]
+    fn filtering_updates_totals_search_and_hit_without_changing_indices() {
+        let mut tree = Tree::new("project");
+        tree.insert(file("app/user.rb", 10, false));
+        tree.insert(file("spec/user_spec.rb", 30, false));
+        tree.insert(file("lib/worker.rb", 20, false));
+        tree.update_weights(false);
+        let world = R { x: 0.0, y: 0.0, w: 1000.0, h: 800.0 };
+        tree.layout(world);
+        let spec = tree.find("spec/user_spec.rb").unwrap();
+        let user = tree.find("app/user.rb").unwrap();
+        let len = tree.nodes.len();
+        let old_rect = tree.nodes[spec].rect;
+        let point = (old_rect.x + old_rect.w / 2.0, old_rect.y + old_rect.h / 2.0);
+        assert_eq!(tree.hit(point.0, point.1, 0.0), Some(spec));
+
+        tree.apply_filter(&Filter::parse("app | spec/").unwrap(), true, None);
+        assert_eq!(tree.nodes[0].total_files, 1);
+        assert_eq!(tree.nodes[0].total_lines, 10);
+        assert_eq!(tree.nodes[0].bytes, 100);
+        assert!(tree.is_visible(user));
+        assert!(!tree.is_visible(spec));
+        assert_eq!(tree.nodes[spec].rect, R::default());
+        assert_ne!(tree.hit(point.0, point.1, 0.0), Some(spec));
+        assert!(tree.search("spec").is_empty());
+        assert_eq!(tree.search("user"), vec![user]);
+        tree.search("");
+        assert!(!tree.nodes[spec].lit);
+        assert!(!tree.nodes[spec].on_path);
+
+        tree.apply_filter(&Filter::default(), false, None);
+        tree.layout(world);
+        assert_eq!(tree.nodes.len(), len);
+        assert_eq!(tree.find("app/user.rb"), Some(user));
+        assert_eq!(tree.nodes[0].total_files, 3);
+        assert_eq!(tree.nodes[0].total_lines, 60);
+        assert_eq!(tree.nodes[0].bytes, 600);
+        assert!(tree.is_visible(spec));
+        assert_ne!(tree.nodes[spec].rect, R::default());
+    }
+
+    #[test]
+    fn allowlist_retains_only_selected_leaves_and_their_ancestors() {
+        let mut tree = Tree::new("project");
+        tree.insert(file("app/models/user.rb", 10, false));
+        tree.insert(file("app/models/team.rb", 20, false));
+        tree.insert(file("lib/worker.rb", 30, false));
+        tree.update_weights(false);
+        let selected = HashSet::from(["app/models/user.rb".to_string(), "lib".to_string()]);
+        tree.apply_filter(&Filter::default(), false, Some(&selected));
+        assert_eq!(tree.nodes[0].total_files, 1);
+        for path in ["", "app", "app/models", "app/models/user.rb"] {
+            assert!(tree.is_visible(tree.find(path).unwrap()), "hid {path}");
+        }
+        for path in ["app/models/team.rb", "lib", "lib/worker.rb"] {
+            assert!(!tree.is_visible(tree.find(path).unwrap()), "showed {path}");
+        }
+        tree.apply_filter(&Filter::parse("lib").unwrap(), false, Some(&selected));
+        assert_eq!(tree.nodes[0].total_files, 0);
+        assert!(!tree.is_visible(0));
+        tree.layout(R { x: 0.0, y: 0.0, w: 100.0, h: 100.0 });
+        assert_eq!(tree.hit(50.0, 50.0, 0.0), None);
+        assert!(tree.search("lib").is_empty());
+    }
+
+    #[test]
+    fn graft_and_ignored_toggle_preserve_the_current_filter() {
+        let mut tree = Tree::new("project");
+        tree.insert(file("app/user.rb", 10, false));
+        tree.insert(Entry { path: "vendor".into(), kind: EntryKind::Ghost { dir: true }, ignored: true });
+        let vendor = tree.find("vendor").unwrap();
+        tree.update_weights(true);
+        assert!(tree.is_visible(vendor));
+        tree.apply_filter(&Filter::parse("-spec/").unwrap(), true, None);
+        assert!(tree.is_visible(vendor));
+        tree.graft(vendor, vec![file("vendor/user.rb", 20, true), file("vendor/spec/user_spec.rb", 30, true)]);
+        tree.update_weights(true);
+        assert_eq!(tree.nodes[0].total_files, 2);
+        assert_eq!(tree.nodes[0].total_lines, 30);
+        assert!(!tree.is_visible(tree.find("vendor/spec/user_spec.rb").unwrap()));
+        tree.update_weights(false);
+        assert_eq!(tree.nodes[0].total_files, 1);
+        assert!(!tree.is_visible(vendor));
+        tree.update_weights(true);
+        assert_eq!(tree.nodes[0].total_files, 2);
+        tree.apply_filter(&Filter::default(), false, None);
+        assert_eq!(tree.nodes[0].total_files, 3);
+        assert_eq!(tree.nodes[0].total_lines, 60);
+    }
+
+    #[test]
+    fn layout_clears_rectangles_when_a_parent_has_no_room() {
+        let mut tree = Tree::new("project");
+        tree.insert(file("app/user.rb", 10, false));
+        tree.update_weights(false);
+        tree.layout(R { x: 0.0, y: 0.0, w: 1000.0, h: 800.0 });
+        let user = tree.find("app/user.rb").unwrap();
+        assert!(tree.nodes[user].rect.w > 0.0);
+        tree.layout(R::default());
+        assert_eq!(tree.nodes[user].rect, R::default());
+        assert_eq!(tree.hit(20.0, 20.0, 0.0), None);
+    }
 }
