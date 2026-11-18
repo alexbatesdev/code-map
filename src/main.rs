@@ -16,6 +16,7 @@ mod scan;
 #[cfg(target_os="macos")] mod editor;
 #[cfg(target_os="macos")] mod remote;
 #[cfg(target_os="macos")] mod ui;
+#[cfg(target_os="macos")] mod file_tree;
 
 #[cfg(not(target_os="macos"))]
 fn main() { eprintln!("The megamap window currently requires macOS. Use the scan binary for portable analysis."); std::process::exit(1); }
