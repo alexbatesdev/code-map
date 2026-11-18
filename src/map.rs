@@ -1,127 +1,45 @@
-//! The map widget: draws the tree as nested rectangles and lets you fly around it.
-//!
-//! Everything is a quad drawn by one tiny pixel shader. Makepad batches
-//! all quads of the same shader into one GPU draw call, which is why drawing
-//! a hundred thousand of them per frame is fine.
-
-use crate::history::{self, History};
-use crate::call_colors::{self, CallHighlights, CallMark};
-use crate::filter::Filter;
-use crate::evidence::{EvidenceFilter, EvidenceKind};
-use crate::evidence_input::{self, EvidenceInput};
-use crate::relationships::{supports_path, CallEdge, Direction, Graph, Reachability, SourceFile, SymbolRef};
-use crate::syntax::HighlightedText;
-use crate::source_cache::{self, SourceCache};
-use crate::model::{code_inner, frame, ColorMode, Kind, Tree, CHAR_W, COL_CHARS, R};
-use crate::scan::{self, Entry};
-use makepad_widgets::*;
-use std::{
-    collections::HashMap,
-    path::PathBuf,
-    sync::{Arc, mpsc::{channel, sync_channel, Receiver, Sender, SyncSender}},
-    time::Instant,
+use crate::{
+    canvas::Canvas,
+    math::{vec2 as dvec2, Vec2 as DVec2, Rect, intersection},
+    history::{self, History},
+    call_colors::{self, CallHighlights, CallMark},
+    filter::Filter,
+    evidence::{EvidenceFilter, EvidenceKind},
+    evidence_input::{self, EvidenceInput},
+    relationships::{supports_path, CallEdge, Direction, Graph, Reachability, SourceFile, SymbolRef},
+    syntax::HighlightedText,
+    source_cache::{self, SourceCache},
+    model::{code_inner, frame, ColorMode, Kind, Tree, CHAR_W, COL_CHARS, R},
+    scan::{self, Entry},
 };
+use std::{collections::HashMap, path::PathBuf, sync::{Arc, mpsc::{channel, sync_channel, Receiver, Sender, SyncSender}}, time::Instant};
 
-/// Below this many screen pixels per line, a file is just a tinted box.
 const STRIPS_FROM_PX: f64 = 0.6;
-/// From this many pixels per line, draw the real text instead of strips.
 const TEXT_FROM_PX: f64 = 9.0;
-/// Hard cap on quads per frame, a safety net for huge projects.
 const QUAD_BUDGET: usize = 400_000;
 const LABEL_BUDGET: usize = 500;
 pub const DEFAULT_SHOW_IGNORED: bool = false;
 pub const DEFAULT_SYNTAX_COLORS: bool = true;
+type Vec4f = [f32; 4];
+fn vec4(r: f32, g: f32, b: f32, a: f32) -> Vec4f { [r, g, b, a] }
 
 #[derive(Clone, Copy, PartialEq)]
-enum ViewUpdate {
-    Fit,
-    Preserve,
-}
+enum ViewUpdate { Fit, Preserve }
 
 #[derive(Clone, Copy)]
-struct SourceAnchor {
-    index: usize,
-    line: usize,
-    x: f64,
-    y: f64,
-    screen: DVec2,
-    line_px: f64,
-}
-
-script_mod! {
-    use mod.prelude.widgets.*
-    use mod.widgets.*
-
-    // The shader for every box, line strip and label pill. `self.pos` is the
-    // position inside the quad (0..1) and `self.rect_size` its size in pixels,
-    // just like UV coordinates and a resolution uniform in a Three.js shader.
-    set_type_default() do #(DrawBlock::script_shader(vm)){
-        ..mod.draw.DrawQuad
-        color: #x202630
-        edge: #x000000
-        border: 0.0
-        hatch: 0.0
-        pixel: fn() {
-            let p = self.pos * self.rect_size
-            let d = min(min(p.x, p.y), min(self.rect_size.x - p.x, self.rect_size.y - p.y))
-            // diagonal stripes mark ignored things
-            let stripe = step(0.5, fract((p.x + p.y) / 10.0)) * self.hatch
-            let base = vec4(self.color.rgb * (1.0 + 0.6 * stripe), self.color.w)
-            let cov = clamp(self.border - d + 0.5, 0.0, 1.0) * step(0.01, self.border)
-            let c = mix(base, self.edge, cov)
-            return vec4(c.rgb * c.w, c.w)
-        }
-    }
-
-    mod.widgets.CodeMapBase = #(CodeMap::register_widget(vm))
-    mod.widgets.CodeMap = set_type_default() do mod.widgets.CodeMapBase{
-        width: Fill
-        height: Fill
-        draw_bg +: {color: #x07090c}
-        draw_block +: {}
-        draw_label +: {
-            color: #xe6ebf0
-            text_style: theme.font_regular{font_size: 8.0}
-        }
-        draw_code +: {
-            color: #xc9d1d9
-            text_style: theme.font_code{font_size: 6.0}
-        }
-    }
-}
-
-#[derive(Script, ScriptHook)]
-#[repr(C)]
-pub struct DrawBlock {
-    #[deref]
-    draw_super: DrawQuad,
-    #[live]
-    color: Vec4f,
-    #[live]
-    edge: Vec4f,
-    #[live]
-    border: f32,
-    #[live]
-    hatch: f32,
-}
-
-/// What the app shows in the inspector panel.
-#[derive(Clone, Debug, Default)]
-pub struct NodeInfo {
-    pub title: String,
-    pub path: String,
-    pub details: String,
-}
+struct SourceAnchor { index: usize, line: usize, x: f64, y: f64, screen: DVec2, line_px: f64 }
 
 #[derive(Clone, Debug, Default)]
-pub enum CodeMapAction {
-    #[default]
-    None,
-    Selected(NodeInfo),
-    Status(String),
-    Root(String, usize),
-    EvidenceStatus(String),
-}
+pub struct NodeInfo { pub title: String, pub path: String, pub details: String }
+
+#[derive(Clone, Debug)]
+pub struct CallLink { pub rect: R, pub target: CallTarget }
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CallTarget { pub definition: SymbolRef, pub inference: Option<String>, pub evidence: EvidenceKind }
+
+struct Label { rect: Rect, text: String, dim: bool }
+#[derive(Clone, Copy)]
+struct Drag { start: DVec2, start_off: DVec2, moved: bool, taps: u32, follow_link: bool, button: u32 }
 
 enum ScanMsg {
     Project(Result<scan::ProjectScan, String>, f64),
@@ -130,169 +48,112 @@ enum ScanMsg {
     Graph(GraphUpdate),
     Text(u64, usize, HighlightedText),
 }
-
 struct GraphUpdate {
-    generation: u64,
-    graph: Graph,
-    read_errors: usize,
-    status: String,
-    view: ViewUpdate,
-    entries: Vec<Entry>,
-    source_texts: HashMap<String, Arc<String>>,
+    generation: u64, graph: Graph, read_errors: usize, status: String, view: ViewUpdate,
+    entries: Vec<Entry>, source_texts: HashMap<String, Arc<String>>,
 }
-
 type TextRequest = (u64, usize, PathBuf, String, Option<Arc<String>>);
 
-struct Label {
-    rect: Rect,
-    text: String,
-    dim: bool,
-}
-
-struct CallLink {
-    rect: Rect,
-    target: CallTarget,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct CallTarget {
-    definition: SymbolRef,
-    inference: Option<String>,
-    evidence: EvidenceKind,
-}
-
-#[derive(Clone, Copy)]
-struct Drag {
-    start: DVec2,
-    start_off: DVec2,
-    moved: bool,
-    taps: u32,
-    follow_link: bool,
-}
-
-#[derive(Script, ScriptHook, Widget)]
-pub struct CodeMap {
-    #[uid]
-    uid: WidgetUid,
-    #[walk]
-    walk: Walk,
-    #[layout]
-    layout: Layout,
-    #[redraw]
-    #[area]
-    area: Area,
-    #[live]
-    draw_bg: DrawColor,
-    #[live]
-    draw_block: DrawBlock,
-    #[live]
-    draw_label: DrawText,
-    #[live]
-    draw_code: DrawText,
-
-    #[rust]
+pub struct Map {
     root: PathBuf,
-    #[rust]
     tree: Tree,
-    #[rust(DEFAULT_SHOW_IGNORED)]
-    show_ignored: bool,
-    #[rust]
+    pub show_ignored: bool,
     needs_layout: bool,
-    #[rust]
     needs_fit: bool,
-    #[rust]
     source_anchor: Option<SourceAnchor>,
-    /// The map's rectangle on screen, from the last draw.
-    #[rust]
     view: Rect,
-    /// World size of the whole map.
-    #[rust]
     world: R,
-    /// Camera: screen = view.pos + (world - cam_off) * cam_scale
-    #[rust]
     cam_scale: f64,
-    #[rust]
     cam_off: DVec2,
-    /// Where a double click is flying the camera to: (world center, scale).
-    #[rust]
     flight: Option<(DVec2, f64)>,
-    #[rust]
+    flight_tick: Instant,
     drag: Option<Drag>,
-    #[rust]
     hover: Option<usize>,
-    #[rust]
     selected: Option<usize>,
-    #[rust]
     definition_focus: Option<CallTarget>,
-    #[rust]
     call_links: Vec<CallLink>,
-    #[rust]
     label_rects: Vec<Rect>,
-    #[rust]
-    color_mode: ColorMode,
-    #[rust(DEFAULT_SYNTAX_COLORS)]
-    syntax_colors: bool,
-    #[rust]
+    pub color_mode: ColorMode,
+    pub syntax_colors: bool,
     call_highlights: CallHighlights,
-    #[rust]
     history: Option<History>,
-    #[rust]
     search: String,
-    #[rust]
     filter: Filter,
-    #[rust]
     filter_error: Option<String>,
-    #[rust]
-    hide_tests: bool,
-    #[rust]
-    relationship_mode: usize,
-    #[rust(1)]
-    relationship_depth: usize,
-    #[rust]
+    pub hide_tests: bool,
+    pub relationship_mode: usize,
+    pub relationship_depth: usize,
     relationship_root: Option<String>,
-    #[rust]
     graph: Option<Graph>,
-    #[rust]
     graph_loading: bool,
-    #[rust]
     graph_read_errors: usize,
-    #[rust]
     graph_generation: u64,
-    #[rust]
     evidence_input: EvidenceInput,
-    #[rust]
-    evidence_mode: usize,
-    #[rust]
+    pub evidence_mode: usize,
     evidence_status: String,
-    #[rust]
     scan_ready: bool,
-    #[rust]
     reachable: Option<Reachability>,
-    #[rust]
     matches: Vec<usize>,
-    #[rust]
     match_cursor: usize,
-    #[rust]
     tx: Option<Sender<ScanMsg>>,
-    #[rust]
     rx: Option<Receiver<ScanMsg>>,
-    #[rust]
     pending: usize,
-    #[rust]
-    frame: NextFrame,
-    /// File contents for the fully zoomed-in view, loaded on demand.
-    #[rust]
     content: SourceCache,
-    #[rust]
     text_worker: Option<SyncSender<TextRequest>>,
-    #[rust]
     message: String,
-    #[rust]
     labels: Vec<Label>,
+    dirty: bool,
 }
 
-impl CodeMap {
-    pub fn open(&mut self, cx: &mut Cx, root: PathBuf) {
+impl Map {
+    pub fn new(root: PathBuf) -> Self {
+        let mut map = Self::empty();
+        map.open(root);
+        map
+    }
+
+    fn empty() -> Self {
+        Self {
+            root: PathBuf::new(), tree: Tree::new("project"), show_ignored: DEFAULT_SHOW_IGNORED,
+            needs_layout: true, needs_fit: true, source_anchor: None, view: Rect::default(), world: R::default(),
+            cam_scale: 1.0, cam_off: DVec2::default(), flight: None, flight_tick: Instant::now(), drag: None,
+            hover: None, selected: None, definition_focus: None, call_links: Vec::new(), label_rects: Vec::new(),
+            color_mode: ColorMode::FileType, syntax_colors: DEFAULT_SYNTAX_COLORS, call_highlights: CallHighlights::default(),
+            history: None, search: String::new(), filter: Filter::default(), filter_error: None, hide_tests: false,
+            relationship_mode: 0, relationship_depth: 1, relationship_root: None, graph: None, graph_loading: false,
+            graph_read_errors: 0, graph_generation: 0, evidence_input: EvidenceInput::Static, evidence_mode: 0,
+            evidence_status: String::new(), scan_ready: false, reachable: None, matches: Vec::new(), match_cursor: 0,
+            tx: None, rx: None, pending: 0, content: SourceCache::default(), text_worker: None,
+            message: String::new(), labels: Vec::new(), dirty: true,
+        }
+    }
+
+    pub fn tick(&mut self) -> bool {
+        self.drain();
+        self.step_flight();
+        std::mem::take(&mut self.dirty)
+    }
+    pub fn needs_frame(&self) -> bool { self.dirty || self.pending > 0 || self.flight.is_some() }
+    pub fn loading(&self) -> bool { self.pending > 0 }
+    pub fn status(&self) -> &str { &self.message }
+    pub fn evidence_status(&self) -> &str { &self.evidence_status }
+    pub fn relationship_root(&self) -> Option<&str> { self.relationship_root.as_deref() }
+    pub fn selection_info(&self) -> Option<NodeInfo> { self.selected.map(|index| self.info(index)) }
+    pub fn links(&self) -> &[CallLink] { &self.call_links }
+    pub fn has_link_at(&self, x: f64, y: f64) -> bool { self.call_at(dvec2(x, y)).is_some() }
+    pub fn debug_snapshot(&self) -> serde_json::Value {
+        serde_json::json!({
+            "root": self.root, "selected": self.selected.map(|index| &self.tree.nodes[index].path),
+            "definition": self.definition_focus.as_ref().map(|target| serde_json::json!({"name":target.definition.name,"file":target.definition.file,"line":target.definition.line,"evidence":target.evidence.label(),"reason":target.inference})),
+            "camera": {"x":self.cam_off.x,"y":self.cam_off.y,"scale":self.cam_scale},
+            "view":[self.view.pos.x,self.view.pos.y,self.view.size.x,self.view.size.y],
+            "loading":self.loading(), "pending":self.pending,
+            "counts":{"nodes":self.tree.nodes.len(),"files":self.tree.nodes[0].total_files,"lines":self.tree.nodes[0].total_lines,"hotlinks":self.call_links.len()},
+            "links":self.call_links.iter().map(|link|serde_json::json!({"rect":[link.rect.x,link.rect.y,link.rect.w,link.rect.h],"name":link.target.definition.name,"file":link.target.definition.file,"line":link.target.definition.line,"evidence":link.target.evidence.label(),"reason":link.target.inference})).collect::<Vec<_>>(),
+        })
+    }
+
+    pub fn open(&mut self, root: PathBuf) {
         let name = root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| root.display().to_string());
         self.tree = Tree::new(&name);
         self.root = root.clone();
@@ -301,6 +162,16 @@ impl CodeMap {
         self.call_links.clear();
         self.source_anchor = None;
         self.hover = None;
+        self.drag = None;
+        self.flight = None;
+        self.world = R::default();
+        self.needs_layout = true;
+        self.needs_fit = true;
+        self.cam_scale = 1.0;
+        self.cam_off = DVec2::default();
+        self.matches.clear();
+        self.match_cursor = 0;
+        self.label_rects.clear();
         self.history = None;
         self.graph = None;
         self.graph_loading = false;
@@ -327,61 +198,57 @@ impl CodeMap {
         self.tx = Some(tx);
         self.rx = Some(rx);
         self.pending = 1;
-        cx.widget_action(self.uid, CodeMapAction::EvidenceStatus(self.evidence_status.clone()));
-        self.set_status(cx, format!("Scanning {} ...", root.display()));
-        // Scanning runs on a background thread so the window stays responsive.
-        // `move` hands ownership of `root` and the sender to that thread.
+        self.set_status(format!("Scanning {} ...", root.display()));
         std::thread::spawn(move || {
             let started = Instant::now();
             let result = scan::scan_project(&root);
             let _ = worker_tx.send(ScanMsg::Project(result, started.elapsed().as_secs_f64()));
         });
-        self.frame = cx.new_next_frame();
-        self.redraw(cx);
+        self.dirty = true;
     }
 
-    fn set_status(&mut self, cx: &mut Cx, message: String) {
+    fn set_status(&mut self, message: String) {
         self.message = message;
-        cx.widget_action(self.uid, CodeMapAction::Status(self.message.clone()));
+        self.dirty = true;
     }
 
-    pub fn set_show_ignored(&mut self, cx: &mut Cx, show: bool) {
+    pub fn set_show_ignored(&mut self, show: bool) {
         self.show_ignored = show;
-        self.apply_selection(cx, ViewUpdate::Fit);
+        self.apply_selection(ViewUpdate::Fit);
     }
 
-    pub fn set_filter(&mut self, cx: &mut Cx, query: &str) {
+    pub fn set_filter(&mut self, query: &str) {
         match Filter::parse(query) {
             Ok(filter) => {
                 self.filter = filter;
                 self.filter_error = None;
-                self.apply_selection(cx, ViewUpdate::Fit);
+                self.apply_selection(ViewUpdate::Fit);
             }
             Err(error) => {
                 self.filter_error = Some(error.clone());
-                self.set_status(cx, format!("Filter error: {error}. Showing the last valid filter."));
+                self.set_status(format!("Filter error: {error}. Showing the last valid filter."));
             }
         }
     }
 
-    pub fn set_hide_tests(&mut self, cx: &mut Cx, hide: bool) {
+    pub fn set_hide_tests(&mut self, hide: bool) {
         self.hide_tests = hide;
-        self.apply_selection(cx, ViewUpdate::Fit);
+        self.apply_selection(ViewUpdate::Fit);
     }
 
-    pub fn set_syntax_colors(&mut self, cx: &mut Cx, on: bool) {
+    pub fn set_syntax_colors(&mut self, on: bool) {
         self.syntax_colors = on;
-        self.redraw(cx);
+        self.dirty = true;
     }
 
-    pub fn set_evidence_mode(&mut self, cx: &mut Cx, mode: usize) {
+    pub fn set_evidence_mode(&mut self, mode: usize) {
         self.evidence_mode = mode.min(4);
         let filter = evidence_filter(self.evidence_mode);
         if self.definition_focus.as_ref().is_some_and(|target| !filter.allows(target.evidence)) { self.definition_focus = None; }
-        self.refresh_relationships(cx, ViewUpdate::Preserve);
+        self.refresh_relationships(ViewUpdate::Preserve);
     }
 
-    pub fn set_evidence_input(&mut self, cx: &mut Cx, input: EvidenceInput) {
+    pub fn set_evidence_input(&mut self, input: EvidenceInput) {
         self.evidence_input = input;
         self.definition_focus = None;
         self.graph_generation = self.graph_generation.wrapping_add(1);
@@ -390,55 +257,53 @@ impl CodeMap {
             EvidenceInput::File(_) => "Loading optional snapshot; existing information remains available…".into(),
             EvidenceInput::Rails => "Capturing optional Rails metadata (45s limit); existing information remains available…".into(),
         };
-        cx.widget_action(self.uid, CodeMapAction::EvidenceStatus(self.evidence_status.clone()));
-        self.refresh_relationships(cx, ViewUpdate::Preserve);
-        self.start_graph(cx);
+        self.refresh_relationships(ViewUpdate::Preserve);
+        self.start_graph();
     }
 
-    pub fn set_relationship_mode(&mut self, cx: &mut Cx, mode: usize) {
+    pub fn set_relationship_mode(&mut self, mode: usize) {
         self.relationship_mode = mode.min(2);
         if mode > 0 && self.relationship_root.is_none() {
-            self.trace_selected_in(cx, self.relationship_mode);
+            self.trace_selected_in(self.relationship_mode);
         } else {
-            self.refresh_relationships(cx, ViewUpdate::Fit);
+            self.refresh_relationships(ViewUpdate::Fit);
         }
     }
 
-    pub fn set_relationship_depth(&mut self, cx: &mut Cx, depth: usize) {
+    pub fn set_relationship_depth(&mut self, depth: usize) {
         self.relationship_depth = depth.clamp(1, 8);
         if self.relationship_mode > 0 && self.graph.is_some() {
-            self.refresh_relationships(cx, ViewUpdate::Preserve);
+            self.refresh_relationships(ViewUpdate::Preserve);
         }
     }
 
-    pub fn trace_selected(&mut self, cx: &mut Cx) {
-        self.trace_selected_in(cx, 1);
+    pub fn trace_selected(&mut self) {
+        self.trace_selected_in(1);
     }
 
-    fn trace_selected_in(&mut self, cx: &mut Cx, mode: usize) {
+    fn trace_selected_in(&mut self, mode: usize) {
         let Some(index) = self.selected.filter(|&i| self.tree.nodes[i].kind == Kind::Text) else {
-            self.set_status(cx, "Select a Ruby, JavaScript or TypeScript file, then Trace selected file.".into());
+            self.set_status("Select a Ruby, JavaScript or TypeScript file, then Trace selected file.".into());
             return;
         };
         let path = self.tree.nodes[index].path.clone();
         if !supports_path(&path) {
-            self.set_status(cx, "Call analysis supports Ruby, JavaScript and TypeScript source files.".into());
+            self.set_status("Call analysis supports Ruby, JavaScript and TypeScript source files.".into());
             return;
         }
         if self.tree.nodes[index].ignored {
-            self.set_status(cx, "Ignored files are outside the call index. Select a non-ignored source file.".into());
+            self.set_status("Ignored files are outside the call index. Select a non-ignored source file.".into());
             return;
         }
         self.relationship_root = Some(path.clone());
         self.relationship_mode = mode;
-        cx.widget_action(self.uid, CodeMapAction::Root(path, mode));
         if self.graph.is_none() && !self.graph_loading {
-            self.start_graph(cx);
+            self.start_graph();
         }
-        self.refresh_relationships(cx, ViewUpdate::Fit);
+        self.refresh_relationships(ViewUpdate::Fit);
     }
 
-    fn start_graph(&mut self, cx: &mut Cx) {
+    fn start_graph(&mut self) {
         if self.graph_loading || !self.scan_ready { return; }
         let Some(tx) = self.tx.clone() else { return };
         let paths: Vec<String> = self.tree.nodes.iter()
@@ -469,10 +334,9 @@ impl CodeMap {
             let (entries, source_texts) = source_cache::prepare(sources);
             let _ = tx.send(ScanMsg::Graph(GraphUpdate { generation, graph, read_errors, status: evidence.status, view, entries, source_texts }));
         });
-        self.frame = cx.new_next_frame();
     }
 
-    fn refresh_relationships(&mut self, cx: &mut Cx, view: ViewUpdate) {
+    fn refresh_relationships(&mut self, view: ViewUpdate) {
         self.reachable = if self.relationship_mode > 0 {
             self.graph.as_ref().zip(self.relationship_root.as_deref()).map(|(graph, root)| {
                 let direction = if self.relationship_mode == 2 { Direction::Callers } else { Direction::Callees };
@@ -484,10 +348,10 @@ impl CodeMap {
                 }
             })
         } else { None };
-        self.apply_selection(cx, view);
+        self.apply_selection(view);
     }
 
-    fn apply_selection(&mut self, cx: &mut Cx, view: ViewUpdate) {
+    fn apply_selection(&mut self, view: ViewUpdate) {
         let weights: Vec<_> = if view == ViewUpdate::Preserve {
             self.tree.nodes.iter().map(|node| node.weight).collect()
         } else { Vec::new() };
@@ -526,75 +390,71 @@ impl CodeMap {
         if self.definition_focus.as_ref().is_some_and(|focus| self.tree.find(&focus.definition.file).is_none_or(|i| !self.tree.is_visible(i))) {
             self.definition_focus = None;
         }
-        if let Some(index) = self.selected.filter(|&i| self.tree.is_visible(i)) {
-            cx.widget_action(self.uid, CodeMapAction::Selected(self.info(index)));
-        } else if self.selected.is_some() {
+        if self.selected.is_some_and(|index| !self.tree.is_visible(index)) {
             self.selected = None;
-            cx.widget_action(self.uid, CodeMapAction::Selected(NodeInfo::default()));
         }
-        self.set_status(cx, self.summary());
-        self.redraw(cx);
+        self.set_status(self.summary());
+        self.dirty = true;
     }
 
-    pub fn set_color_mode(&mut self, cx: &mut Cx, mode: ColorMode) {
+    pub fn set_color_mode(&mut self, mode: ColorMode) {
         self.color_mode = mode;
         self.tree.compute_heat(mode);
         if mode != ColorMode::FileType && self.history.is_none() {
-            self.set_status(cx, "Reading git history ...".to_string());
+            self.set_status("Reading git history ...".to_string());
         }
-        self.redraw(cx);
+        self.dirty = true;
     }
 
-    pub fn set_search(&mut self, cx: &mut Cx, query: &str) {
+    pub fn set_search(&mut self, query: &str) {
         self.search = query.trim().to_string();
         self.matches = self.tree.search(&self.search);
         self.match_cursor = 0;
         if self.search.is_empty() {
-            self.set_status(cx, self.summary());
+            self.set_status(self.summary());
         } else {
             let text = format!("{} matches for \"{}\". Press Enter to fly to the next one.", fmt_num(self.matches.len() as u64), self.search);
-            self.set_status(cx, text);
+            self.set_status(text);
         }
-        self.redraw(cx);
+        self.dirty = true;
     }
 
-    pub fn next_match(&mut self, cx: &mut Cx) {
+    pub fn next_match(&mut self) {
         if self.matches.is_empty() {
             return;
         }
         let index = self.matches[self.match_cursor % self.matches.len()];
         self.match_cursor += 1;
-        self.select(cx, index);
-        self.fly_to_node(cx, index);
+        self.select(index);
+        self.fly_to_node(index);
     }
 
-    pub fn fit(&mut self, cx: &mut Cx) {
+    pub fn fit(&mut self) {
         let world = self.world;
-        self.fly_to(cx, world, 1.0);
+        self.fly_to(world, 1.0);
     }
 
-    fn fly_to(&mut self, cx: &mut Cx, r: R, fill: f64) {
+    fn fly_to(&mut self, r: R, fill: f64) {
         self.source_anchor = None;
-        if self.view.size.x <= 0.0 || r.w <= 0.0 || r.h <= 0.0 {
+        if self.view.size.x <= 0.0 || self.view.size.y <= 0.0 || r.w <= 0.0 || r.h <= 0.0 {
             return;
         }
         let scale = (self.view.size.x / r.w).min(self.view.size.y / r.h) * fill;
+        if !scale.is_finite() || scale <= 0.0 { return; }
         self.flight = Some((dvec2(r.x + r.w * 0.5, r.y + r.h * 0.5), scale));
-        self.frame = cx.new_next_frame();
     }
 
-    fn fly_to_node(&mut self, cx: &mut Cx, index: usize) {
+    fn fly_to_node(&mut self, index: usize) {
         let r = self.tree.nodes[index].rect;
-        self.fly_to(cx, r, 0.95);
+        self.fly_to(r, 0.95);
     }
 
-    fn select(&mut self, cx: &mut Cx, index: usize) {
+    fn select(&mut self, index: usize) {
         if self.definition_focus.take().is_some() {
-            self.set_status(cx, self.summary());
+            self.set_status(self.summary());
         }
         self.selected = Some(index);
-        cx.widget_action(self.uid, CodeMapAction::Selected(self.info(index)));
-        self.redraw(cx);
+        self.dirty = true;
     }
 
     fn definition_line_rect(&self, index: usize, line: usize) -> Option<R> {
@@ -603,7 +463,7 @@ impl CodeMap {
         node.code_line_rect(line)
     }
 
-    fn jump_to_definition(&mut self, cx: &mut Cx, target: CallTarget) {
+    fn jump_to_definition(&mut self, target: CallTarget) {
         self.source_anchor = None;
         let definition = &target.definition;
         let Some(index) = self.tree.find(&definition.file) else { return };
@@ -611,21 +471,19 @@ impl CodeMap {
         self.flight = None;
         let source = self.tree.nodes[index].lines[definition.line - 1];
         self.flight = Some(definition_camera(line, source.indent as usize, source.len as usize, self.view.size));
-        self.frame = cx.new_next_frame();
         self.definition_focus = Some(target.clone());
         self.selected = Some(index);
-        self.ensure_text(cx, index);
-        cx.widget_action(self.uid, CodeMapAction::Selected(self.info(index)));
-        self.set_status(cx, format!("{} · {}", self.summary(), target_description(&target)));
-        self.redraw(cx);
+        self.ensure_text(index);
+        self.set_status(format!("{} · {}", self.summary(), target_description(&target)));
+        self.dirty = true;
     }
 
     fn call_at(&self, abs: DVec2) -> Option<CallTarget> {
         if !self.view.contains(abs) || self.label_rects.iter().any(|r| r.contains(abs)) { return None; }
-        self.call_links.iter().find(|link| link.rect.contains(abs)).map(|link| link.target.clone())
+        self.call_links.iter().find(|link| link.rect.contains(abs.x, abs.y)).map(|link| link.target.clone())
     }
 
-    fn expand(&mut self, cx: &mut Cx, index: usize) {
+    fn expand(&mut self, index: usize) {
         let Kind::Ghost { dir, loading: false } = self.tree.nodes[index].kind else { return };
         let Some(tx) = self.tx.clone() else { return };
         self.tree.nodes[index].kind = Kind::Ghost { dir, loading: true };
@@ -636,8 +494,7 @@ impl CodeMap {
             let entries = scan::scan_ignored(&root, &path);
             let _ = tx.send(ScanMsg::Expanded(path, entries));
         });
-        self.frame = cx.new_next_frame();
-        self.redraw(cx);
+        self.dirty = true;
     }
 
     fn summary(&self) -> String {
@@ -665,8 +522,7 @@ impl CodeMap {
         text
     }
 
-    /// Pick up finished background work.
-    fn drain(&mut self, cx: &mut Cx) {
+    fn drain(&mut self) {
         let Some(rx) = &self.rx else { return };
         let msgs: Vec<ScanMsg> = rx.try_iter().collect();
         for msg in msgs {
@@ -686,12 +542,11 @@ impl CodeMap {
                         secs,
                         if used_git { "ignore rules from git" } else { "no git: read .gitignore files" }
                     );
-                    self.set_status(cx, text);
+                    self.set_status(text);
                     self.needs_layout = true;
                     self.needs_fit = true;
-                    if !matches!(self.evidence_input, EvidenceInput::Static) { self.start_graph(cx); }
+                    if !matches!(self.evidence_input, EvidenceInput::Static) { self.start_graph(); }
                     if used_git {
-                        // git history is slower than the scan, so load it separately
                         if let Some(tx) = self.tx.clone() {
                             let root = self.root.clone();
                             self.pending += 1;
@@ -702,7 +557,7 @@ impl CodeMap {
                     }
                 }
                 ScanMsg::Project(Err(err), _) => {
-                    self.set_status(cx, format!("Could not scan: {err}"));
+                    self.set_status(format!("Could not scan: {err}"));
                 }
                 ScanMsg::Expanded(path, entries) => {
                     if let Some(index) = self.tree.find(&path) {
@@ -710,21 +565,21 @@ impl CodeMap {
                         self.tree.graft(index, entries);
                         self.after_tree_change();
                         self.selected = Some(index);
-                        self.set_status(cx, format!("Read ignored {path}: {} files", fmt_num(count as u64)));
+                        self.set_status(format!("Read ignored {path}: {} files", fmt_num(count as u64)));
                     }
                 }
                 ScanMsg::History(Ok(history)) => {
                     self.tree.apply_history(&history);
                     self.history = Some(history);
                     self.tree.compute_heat(self.color_mode);
-                    self.set_status(cx, self.summary());
+                    self.set_status(self.summary());
                 }
                 ScanMsg::History(Err(err)) => {
-                    self.set_status(cx, format!("No git history: {err}"));
+                    self.set_status(format!("No git history: {err}"));
                 }
                 ScanMsg::Graph(update) => {
                     self.graph_loading = false;
-                    if update.generation != self.graph_generation { self.start_graph(cx); continue; }
+                    if update.generation != self.graph_generation { self.start_graph(); continue; }
                     self.source_anchor = if update.view == ViewUpdate::Preserve { capture_source_anchor(&self.tree, self.view, self.cam_off, self.cam_scale) } else { None };
                     for entry in update.entries { self.tree.insert(entry); }
                     self.content.replace(update.source_texts);
@@ -734,14 +589,13 @@ impl CodeMap {
                     self.graph = Some(update.graph);
                     self.graph_read_errors = update.read_errors;
                     self.evidence_status = update.status;
-                    cx.widget_action(self.uid, CodeMapAction::EvidenceStatus(self.evidence_status.clone()));
-                    self.refresh_relationships(cx, update.view);
+                    self.refresh_relationships(update.view);
                 }
                 ScanMsg::Text(generation, index, text) => {
                     self.content.accept(generation, index, text);
                 }
             }
-            self.redraw(cx);
+            self.dirty = true;
         }
     }
 
@@ -759,7 +613,6 @@ impl CodeMap {
     fn relayout(&mut self) {
         self.tree.update_weights(self.show_ignored);
         if self.world.w <= 0.0 {
-            // the world is the size of the first view, so zoom 1.0 is "fit"
             self.world = R { x: 0.0, y: 0.0, w: self.view.size.x.max(100.0), h: self.view.size.y.max(100.0) };
         }
         self.tree.layout(self.world);
@@ -778,19 +631,22 @@ impl CodeMap {
     }
 
     fn hit(&self, abs: DVec2) -> Option<usize> {
-        if self.tree.is_empty() || self.cam_scale <= 0.0 {
+        if self.tree.is_empty() || self.cam_scale <= 0.0 || !self.view.contains(abs) {
             return None;
         }
         let p = self.to_world(abs);
         self.tree.hit(p.x, p.y, 3.0 / self.cam_scale)
     }
 
-    fn step_flight(&mut self, cx: &mut Cx) {
+    fn step_flight(&mut self) {
+        let now = Instant::now();
+        let dt = now.duration_since(self.flight_tick).as_secs_f64().min(0.05);
+        self.flight_tick = now;
         let Some((center, scale)) = self.flight else { return };
+        if self.cam_scale <= 0.0 || self.view.size.x <= 0.0 { return; }
         let half = self.view.size * 0.5;
         let now_center = self.cam_off + half / self.cam_scale;
-        let k = 0.2;
-        // interpolate zoom in log space so zooming in and out feel the same
+        let k = 1.0 - (-14.0 * dt).exp();
         let new_scale = (self.cam_scale.ln() + (scale.ln() - self.cam_scale.ln()) * k).exp();
         let new_center = now_center + (center - now_center) * k;
         self.cam_scale = new_scale;
@@ -799,10 +655,8 @@ impl CodeMap {
             self.cam_scale = scale;
             self.cam_off = center - half / scale;
             self.flight = None;
-        } else {
-            self.frame = cx.new_next_frame();
         }
-        self.redraw(cx);
+        self.dirty = true;
     }
 
     fn info(&self, index: usize) -> NodeInfo {
@@ -897,7 +751,6 @@ impl CodeMap {
         !self.search.is_empty()
     }
 
-    /// Base color of a file for the current color mode.
     fn file_color(&self, index: usize) -> Vec4f {
         let node = &self.tree.nodes[index];
         if self.reachable.is_some() && node.is_file() {
@@ -913,7 +766,108 @@ impl CodeMap {
         }
     }
 
-    fn draw_map(&mut self, cx: &mut Cx2d) {
+    pub fn draw(&mut self, canvas: &mut Canvas, view: R) {
+        self.call_links.clear();
+        self.label_rects.clear();
+        self.view = view.into();
+        if [view.x, view.y, view.w, view.h].iter().any(|value| !value.is_finite()) || view.w <= 0.0 || view.h <= 0.0 { return; }
+        canvas.rect(view, vec4(0.025, 0.035, 0.045, 1.0), [0.0; 4], 0.0, 0.0, view);
+        if self.tree.is_empty() {
+            let message = if self.message.is_empty() { "No folder opened" } else { &self.message };
+            canvas.text(message, view.x + 16.0, view.y + 16.0, 12.0, vec4(0.7, 0.7, 0.7, 1.0), view, false);
+            return;
+        }
+        if self.needs_layout {
+            self.relayout();
+            if let Some(anchor) = self.source_anchor.take() {
+                if let Some((offset, scale)) = restore_source_anchor(&self.tree, anchor) {
+                    self.cam_off = offset;
+                    self.cam_scale = scale;
+                }
+            }
+        }
+        if self.tree.nodes[0].weight <= 0.0 {
+            canvas.text("No files match this selection. Clear the filter or choose All files.", view.x + 16.0, view.y + 16.0, 12.0, vec4(0.7, 0.7, 0.7, 1.0), view, false);
+            return;
+        }
+        if self.needs_fit {
+            self.cam_scale = (view.w / self.world.w).min(view.h / self.world.h);
+            let half = self.view.size * 0.5;
+            self.cam_off = dvec2(self.world.w * 0.5, self.world.h * 0.5) - half / self.cam_scale;
+            self.needs_fit = false;
+        }
+        self.labels.clear();
+        self.draw_map(canvas);
+        if let Some(index) = self.hover.filter(|&index| self.tree.is_visible(index)) {
+            self.outline(canvas, index, vec4(1.0, 1.0, 1.0, 0.5), 1.5);
+        }
+        if let Some(index) = self.selected.filter(|&index| self.tree.is_visible(index)) {
+            self.outline(canvas, index, vec4(0.35, 0.85, 1.0, 1.0), 2.5);
+        }
+        self.draw_labels(canvas);
+    }
+
+    pub fn pointer_move(&mut self, x: f64, y: f64) {
+        if !x.is_finite() || !y.is_finite() { return; }
+        let abs = dvec2(x, y);
+        if let Some(mut drag) = self.drag {
+            if (abs - drag.start).length() > 4.0 { drag.moved = true; }
+            if drag.moved && self.cam_scale > 0.0 {
+                self.cam_off = drag.start_off - (abs - drag.start) / self.cam_scale;
+                self.dirty = true;
+            }
+            self.drag = Some(drag);
+        }
+        let hover = self.hit(abs);
+        if hover != self.hover { self.hover = hover; self.dirty = true; }
+    }
+
+    #[cfg(test)]
+    pub fn pointer_down(&mut self, x: f64, y: f64, button: u32, clicks: u32) {
+        self.pointer_down_with_modifiers(x, y, button, clicks, 0);
+    }
+
+    pub fn pointer_down_with_modifiers(&mut self, x: f64, y: f64, button: u32, clicks: u32, modifiers: u32) {
+        let abs = dvec2(x, y);
+        if !x.is_finite() || !y.is_finite() || !self.view.contains(abs) { return; }
+        self.source_anchor = None;
+        self.flight = None;
+        self.drag = Some(Drag { start: abs, start_off: self.cam_off, moved: false, taps: clicks, follow_link: button == 0 && modifiers & crate::platform::SHIFT == 0, button });
+    }
+
+    pub fn pointer_up(&mut self, x: f64, y: f64, button: u32) {
+        let Some(drag) = self.drag.take() else { return };
+        if drag.button != button { self.drag = Some(drag); return; }
+        let abs = dvec2(x, y);
+        if !x.is_finite() || !y.is_finite() || drag.moved || !self.view.contains(abs) { return; }
+        if drag.follow_link {
+            if let Some(target) = self.call_at(drag.start).filter(|target| self.call_at(abs).as_ref() == Some(target)) {
+                self.jump_to_definition(target);
+                return;
+            }
+        }
+        if let Some(index) = self.hit(abs) {
+            self.select(index);
+            if matches!(self.tree.nodes[index].kind, Kind::Ghost { .. }) { self.expand(index); }
+            else if drag.taps >= 2 { self.fly_to_node(index); }
+        }
+    }
+
+    pub fn scroll(&mut self, x: f64, y: f64, dy: f64) {
+        let abs = dvec2(x, y);
+        if !x.is_finite() || !y.is_finite() || !dy.is_finite() || !self.view.contains(abs) || self.cam_scale <= 0.0 || self.world.w <= 0.0 || self.world.h <= 0.0 { return; }
+        self.source_anchor = None;
+        self.flight = None;
+        let factor = (-dy * 0.01).clamp(-20.0, 20.0).exp();
+        let anchor = self.to_world(abs);
+        let min_scale = (self.view.size.x / self.world.w).min(self.view.size.y / self.world.h) * 0.5;
+        self.cam_scale = (self.cam_scale * factor).clamp(min_scale, min_scale * 200_000.0);
+        self.cam_off = anchor - (abs - self.view.pos) / self.cam_scale;
+        self.hover = self.hit(abs);
+        self.dirty = true;
+    }
+
+    fn draw_map(&mut self, canvas: &mut Canvas) {
         let view = self.view;
         let searching = self.search_active();
         let mut quads = 0usize;
@@ -935,7 +889,6 @@ impl CodeMap {
             if quads > QUAD_BUDGET {
                 break;
             }
-            // search: things off the path to a match fade into the background
             let fade = if searching && self.reachable.is_none() && !node.on_path { 0.22 } else { 1.0 };
             let small = r.size.x.min(r.size.y);
             let border = if small > 8.0 { 1.0 } else { 0.0 };
@@ -943,7 +896,7 @@ impl CodeMap {
                 Kind::Dir => {
                     let shade = 0.07 + 0.03 * (node.depth.min(5) as f32);
                     let color = if node.ignored { vec4(shade * 1.3, shade, shade * 0.8, 1.0) } else { vec4(shade * 0.85, shade, shade * 1.25, 1.0) };
-                    block(&mut self.draw_block, cx, r, scale_rgb(color, fade), vec4(0.0, 0.0, 0.0, 0.6), border, if node.ignored { 0.4 } else { 0.0 });
+                    block(canvas, self.view, r, scale_rgb(color, fade), vec4(0.0, 0.0, 0.0, 0.6), border, if node.ignored { 0.4 } else { 0.0 });
                     quads += 1;
                     if small > 4.0 {
                         stack.extend(node.children.iter().rev());
@@ -958,13 +911,13 @@ impl CodeMap {
                     let dark = if node.ignored { 0.12 } else { 0.17 };
                     let bg = scale_rgb(base, dark * fade);
                     let edge = scale_rgb(base, 0.35 * fade);
-                    block(&mut self.draw_block, cx, r, bg, edge, border, if node.ignored { 0.3 } else { 0.0 });
+                    block(canvas, self.view, r, bg, edge, border, if node.ignored { 0.3 } else { 0.0 });
                     quads += 1;
-                    quads += self.draw_code_lines(cx, index, fade);
+                    quads += self.draw_code_lines(canvas, index, fade);
                 }
                 Kind::Binary => {
                     let base = self.file_color(index);
-                    block(&mut self.draw_block, cx, r, scale_rgb(base, 0.35 * fade), scale_rgb(base, 0.6 * fade), border, 0.5);
+                    block(canvas, self.view, r, scale_rgb(base, 0.35 * fade), scale_rgb(base, 0.6 * fade), border, 0.5);
                     quads += 1;
                     if r.size.x > 60.0 && r.size.y > 18.0 {
                         self.labels.push(Label { rect: r, text: node.name.clone(), dim: true });
@@ -972,7 +925,7 @@ impl CodeMap {
                 }
                 Kind::Ghost { loading, .. } => {
                     let color = if loading { vec4(0.20, 0.17, 0.08, 1.0) } else { vec4(0.10, 0.09, 0.08, 1.0) };
-                    block(&mut self.draw_block, cx, r, scale_rgb(color, fade), vec4(0.45, 0.38, 0.25, fade), border, 1.0);
+                    block(canvas, self.view, r, scale_rgb(color, fade), vec4(0.45, 0.38, 0.25, fade), border, 1.0);
                     quads += 1;
                     if r.size.x > 60.0 && r.size.y > 18.0 {
                         let text = if loading { format!("{} (reading...)", node.name) } else { format!("{} (ignored)", node.name) };
@@ -981,20 +934,18 @@ impl CodeMap {
                 }
             }
         }
-        // outline search matches so they pop out even when small
         if searching {
             for k in 0..self.matches.len().min(5000) {
                 let index = self.matches[k];
                 let r = self.to_screen(self.tree.nodes[index].rect);
                 if r.size.x >= 2.0 && self.tree.nodes[index].weight > 0.0 {
-                    block(&mut self.draw_block, cx, r, vec4(0.0, 0.0, 0.0, 0.0), vec4(1.0, 0.85, 0.2, 1.0), 2.0, 0.0);
+                    block(canvas, self.view, r, vec4(0.0, 0.0, 0.0, 0.0), vec4(1.0, 0.85, 0.2, 1.0), 2.0, 0.0);
                 }
             }
         }
     }
 
-    /// Returns how many quads were drawn.
-    fn draw_code_lines(&mut self, cx: &mut Cx2d, index: usize, fade: f32) -> usize {
+    fn draw_code_lines(&mut self, canvas: &mut Canvas, index: usize, fade: f32) -> usize {
         let node = &self.tree.nodes[index];
         let line_px = node.line_h * self.cam_scale;
         let r_screen = self.to_screen(node.rect);
@@ -1014,20 +965,16 @@ impl CodeMap {
         let view = self.view;
         let text_mode = line_px >= TEXT_FROM_PX;
         if text_mode {
-            self.ensure_text(cx.cx, index);
+            self.ensure_text(index);
         }
         let node = &self.tree.nodes[index];
         let code_color = vec4(0.49 * fade, 0.52 * fade, 0.56 * fade, 1.0);
         let comment_color = if self.syntax_colors { vec4(0.30 * fade, 0.40 * fade, 0.30 * fade, 1.0) } else { code_color };
         let mut drawn = 0;
-        // only visit the columns and rows that are actually on screen
         let first_col = ((view.pos.x - inner.pos.x) / col_px).floor().max(0.0) as usize;
         let last_col = ((((view.pos.x + view.size.x) - inner.pos.x) / col_px).ceil().max(0.0) as usize).min(cols);
         let first_row = ((view.pos.y - inner.pos.y) / line_px).floor().max(0.0) as usize;
         let last_row = ((((view.pos.y + view.size.y) - inner.pos.y) / line_px).ceil().max(0.0) as usize).min(rows);
-        if text_mode {
-            self.draw_code.text_style.font_size = (line_px * 0.6) as f32;
-        }
         for col in first_col..last_col {
             for row in first_row..last_row {
                 let k = col * rows + row;
@@ -1036,11 +983,11 @@ impl CodeMap {
                 let line_rect = self.to_screen(source_rect);
                 let (x, y) = (line_rect.pos.x, line_rect.pos.y);
                 if self.definition_focus.as_ref().is_some_and(|target| target.definition.file == node.path && target.definition.line == k + 1) {
-                    block(&mut self.draw_block, cx, line_rect, vec4(0.95, 0.73, 0.24, 0.12), vec4(0.95, 0.73, 0.24, 0.9), 1.5, 0.0);
+                    block(canvas, self.view, line_rect, vec4(0.95, 0.73, 0.24, 0.12), vec4(0.95, 0.73, 0.24, 0.9), 1.5, 0.0);
                 }
                 if text_mode {
                     if let Some(line) = self.content.files.get(&index).and_then(|text| text.lines.get(k)) {
-                        self.call_links.extend(draw_source_line(&mut self.draw_code, cx, line, self.call_highlights.line(&node.path, k + 1), self.relationship_root.as_deref(), self.syntax_colors, dvec2(x, y), line_px, fade));
+                        self.call_links.extend(draw_source_line(canvas, self.view, line, self.call_highlights.line(&node.path, k + 1), self.relationship_root.as_deref(), self.syntax_colors, dvec2(x, y), line_px, fade));
                     }
                 } else if line.len > 0 {
                     let color = if line.comment { comment_color } else { code_color };
@@ -1049,9 +996,9 @@ impl CodeMap {
                         pos: dvec2(x + line.indent as f64 * char_px, y + line_px * 0.18),
                         size: dvec2(w, (line_px * 0.64).max(0.5)),
                     };
-                    block(&mut self.draw_block, cx, rect, color, vec4(0.0, 0.0, 0.0, 0.0), 0.0, 0.0);
+                    block(canvas, self.view, rect, color, vec4(0.0, 0.0, 0.0, 0.0), 0.0, 0.0);
                     drawn += 1;
-                    drawn += draw_call_strips(&mut self.draw_block, cx, self.call_highlights.line(&node.path, k + 1), self.relationship_root.as_deref(), dvec2(x, y), char_px, line_px, fade);
+                    drawn += draw_call_strips(canvas, self.view, self.call_highlights.line(&node.path, k + 1), self.relationship_root.as_deref(), dvec2(x, y), char_px, line_px, fade);
                 }
             }
         }
@@ -1061,24 +1008,23 @@ impl CodeMap {
         drawn
     }
 
-    /// Load a file's text for the fully zoomed-in view (cached).
-    fn ensure_text(&mut self, cx: &mut Cx, index: usize) {
+    fn ensure_text(&mut self, index: usize) {
         if self.content.files.contains_key(&index) || self.content.pending.contains(&index) { return; }
         let relative = self.tree.nodes[index].path.clone();
         let source = self.content.originals.get(&relative).cloned();
         if self.text_worker.as_ref().is_some_and(|tx| tx.try_send((self.content.generation, index, self.root.join(&relative), relative, source)).is_ok()) {
             self.content.pending.insert(index);
             self.pending += 1;
-            self.frame = cx.new_next_frame();
+            self.dirty = true;
         }
     }
 
-    fn outline(&mut self, cx: &mut Cx2d, index: usize, color: Vec4f, width: f32) {
+    fn outline(&mut self, canvas: &mut Canvas, index: usize, color: Vec4f, width: f32) {
         let r = self.to_screen(self.tree.nodes[index].rect);
-        block(&mut self.draw_block, cx, r, vec4(0.0, 0.0, 0.0, 0.0), color, width, 0.0);
+        block(canvas, self.view, r, vec4(0.0, 0.0, 0.0, 0.0), color, width, 0.0);
     }
 
-    fn draw_labels(&mut self, cx: &mut Cx2d) {
+    fn draw_labels(&mut self, canvas: &mut Canvas) {
         let labels = std::mem::take(&mut self.labels);
         for label in labels.iter().take(LABEL_BUDGET) {
             let pos = dvec2(label.rect.pos.x.max(self.view.pos.x) + 4.0, label.rect.pos.y.max(self.view.pos.y) + 3.0);
@@ -1092,230 +1038,62 @@ impl CodeMap {
             } else {
                 label.text.clone()
             };
-            let w = (text.chars().count() as f64 * 5.6 + 8.0).min(room + 4.0);
+            let w = (canvas.text_width(&text, 11.0, false) + 8.0).min(room + 4.0);
             let label_rect = Rect { pos: pos - dvec2(3.0, 1.0), size: dvec2(w, 14.0) };
             self.label_rects.push(label_rect);
-            block(&mut self.draw_block, cx, label_rect, vec4(0.0, 0.0, 0.0, 0.72), vec4(0.0, 0.0, 0.0, 0.0), 0.0, 0.0);
-            self.draw_label.color = if label.dim { vec4(0.75, 0.68, 0.55, 1.0) } else { vec4(0.92, 0.94, 0.96, 1.0) };
-            self.draw_label.draw_abs(cx, pos, &text);
+            block(canvas, self.view, label_rect, vec4(0.0, 0.0, 0.0, 0.72), vec4(0.0, 0.0, 0.0, 0.0), 0.0, 0.0);
+            let color = if label.dim { vec4(0.75, 0.68, 0.55, 1.0) } else { vec4(0.92, 0.94, 0.96, 1.0) };
+            canvas.text(&text, pos.x, pos.y, 11.0, color, self.view.into(), false);
         }
         self.labels = labels;
         self.labels.clear();
     }
 
-    fn handle_input(&mut self, cx: &mut Cx, hit: Hit) {
-        match hit {
-            Hit::FingerMove(e) => {
-                if let Some(mut drag) = self.drag {
-                    if (e.abs - drag.start).length() > 4.0 {
-                        drag.moved = true;
-                    }
-                    if drag.moved {
-                        cx.set_cursor(MouseCursor::Grabbing);
-                        self.cam_off = drag.start_off - (e.abs - drag.start) / self.cam_scale;
-                        self.redraw(cx);
-                    }
-                    self.drag = Some(drag);
-                }
-            }
-            Hit::FingerScroll(e) => {
-                self.source_anchor = None;
-                self.flight = None;
-                // zoom around the point under the mouse
-                let factor = (-e.scroll.y * 0.01).exp();
-                let anchor = self.to_world(e.abs);
-                let min_scale = (self.view.size.x / self.world.w).min(self.view.size.y / self.world.h) * 0.5;
-                self.cam_scale = (self.cam_scale * factor).clamp(min_scale, min_scale * 200_000.0);
-                self.cam_off = anchor - (e.abs - self.view.pos) / self.cam_scale;
-                self.hover = self.hit(e.abs);
-                self.redraw(cx);
-            }
-            _ => {}
-        }
-    }
 }
 
-impl Widget for CodeMap {
-    fn draw_walk(&mut self, cx: &mut Cx2d, _scope: &mut Scope, walk: Walk) -> DrawStep {
-        self.call_links.clear();
-        self.label_rects.clear();
-        // begin_turtle clips everything we draw to the widget's own rectangle
-        cx.begin_turtle(walk, self.layout);
-        let rect = cx.turtle().rect();
-        self.draw_bg.draw_abs(cx, rect);
-        self.view = rect;
-
-        if self.tree.is_empty() {
-            self.draw_label.color = vec4(0.7, 0.7, 0.7, 1.0);
-            let message = if self.message.is_empty() { "No folder opened".to_string() } else { self.message.clone() };
-            self.draw_label.draw_abs(cx, rect.pos + dvec2(16.0, 16.0), &message);
-            cx.end_turtle_with_area(&mut self.area);
-            return DrawStep::done();
-        }
-        if self.needs_layout {
-            self.relayout();
-            if let Some(anchor) = self.source_anchor.take() {
-                if let Some((offset, scale)) = restore_source_anchor(&self.tree, anchor) {
-                    self.cam_off = offset;
-                    self.cam_scale = scale;
-                }
+fn draw_source_line(canvas: &mut Canvas, view: Rect, line: &crate::syntax::HighlightedLine, marks: &[CallMark], root: Option<&str>, syntax: bool, pos: DVec2, line_height: f64, fade: f32) -> Vec<CallLink> {
+    let ranges = call_colors::link_ranges(marks, line.text.chars().count().min(COL_CHARS as usize));
+    let mut links = Vec::new();
+    let mut x = pos.x;
+    let mut column = 0;
+    let size = line_height * 0.8;
+    for run in call_colors::paint_line(line, marks, root, syntax, COL_CHARS as usize) {
+        let [r, g, b] = run.color;
+        let width = canvas.text_width(run.text, size, true);
+        let end = column + run.text.chars().count();
+        for range in &ranges {
+            let (start, stop) = (range.start.max(column), range.end.min(end));
+            if stop <= start { continue; }
+            let prefix = run.text.char_indices().nth(start - column).map_or(run.text.len(), |(i, _)| i);
+            let suffix = run.text.char_indices().nth(stop - column).map_or(run.text.len(), |(i, _)| i);
+            let left = canvas.text_width(&run.text[..prefix], size, true);
+            let right = canvas.text_width(&run.text[..suffix], size, true);
+            if let Some(rect) = intersection(R { x: x + left, y: pos.y, w: right - left, h: line_height }, view.into()) {
+                links.push(CallLink { rect, target: CallTarget { definition: range.definition.clone(), inference: range.inference.map(str::to_owned), evidence: range.evidence } });
             }
         }
-        if self.tree.nodes[0].weight <= 0.0 {
-            self.draw_label.color = vec4(0.7, 0.7, 0.7, 1.0);
-            self.draw_label.draw_abs(cx, rect.pos + dvec2(16.0, 16.0), "No files match this selection. Clear the filter or choose All files.");
-            cx.end_turtle_with_area(&mut self.area);
-            return DrawStep::done();
-        }
-        if self.needs_fit && rect.size.x > 0.0 {
-            self.cam_scale = (rect.size.x / self.world.w).min(rect.size.y / self.world.h);
-            let half = rect.size * 0.5;
-            self.cam_off = dvec2(self.world.w * 0.5, self.world.h * 0.5) - half / self.cam_scale;
-            self.needs_fit = false;
-        }
-
-        self.labels.clear();
-        self.draw_map(cx);
-        if let Some(h) = self.hover {
-            if self.tree.is_visible(h) {
-                self.outline(cx, h, vec4(1.0, 1.0, 1.0, 0.5), 1.5);
-            }
-        }
-        if let Some(s) = self.selected {
-            if self.tree.is_visible(s) {
-                self.outline(cx, s, vec4(0.35, 0.85, 1.0, 1.0), 2.5);
-            }
-        }
-        self.draw_labels(cx);
-        cx.end_turtle_with_area(&mut self.area);
-        DrawStep::done()
+        canvas.text(run.text, x, pos.y, size, vec4(r * fade, g * fade, b * fade, 1.0), view.into(), true);
+        x += width;
+        column = end;
     }
-
-    fn handle_event(&mut self, cx: &mut Cx, event: &Event, _scope: &mut Scope) {
-        if self.frame.is_event(event).is_some() {
-            self.drain(cx);
-            self.step_flight(cx);
-            if self.pending > 0 {
-                self.frame = cx.new_next_frame();
-            }
-        }
-        let hit = event.hits(cx, self.area);
-        match &hit {
-            Hit::FingerHoverIn(e) | Hit::FingerHoverOver(e) => {
-                cx.set_cursor(if self.call_at(e.abs).is_some() { MouseCursor::Hand } else { MouseCursor::Default });
-                let hover = self.hit(e.abs);
-                if hover != self.hover {
-                    self.hover = hover;
-                    self.redraw(cx);
-                }
-            }
-            Hit::FingerHoverOut(_) => {
-                cx.set_cursor(MouseCursor::Default);
-                if self.hover.take().is_some() {
-                    self.redraw(cx);
-                }
-            }
-            Hit::FingerDown(e) => {
-                self.source_anchor = None;
-                self.flight = None;
-                self.drag = Some(Drag {
-                    start: e.abs,
-                    start_off: self.cam_off,
-                    moved: false,
-                    taps: e.tap_count,
-                    follow_link: e.device.is_primary_hit() && !e.modifiers.shift,
-                });
-            }
-            Hit::FingerUp(e) => {
-                cx.set_cursor(MouseCursor::Default);
-                if let Some(drag) = self.drag.take() {
-                    if !drag.moved {
-                        if drag.follow_link {
-                            if let Some(target) = self.call_at(drag.start).filter(|target| self.call_at(e.abs).as_ref() == Some(target)) {
-                                self.jump_to_definition(cx, target);
-                                return;
-                            }
-                        }
-                        if let Some(index) = self.hit(e.abs) {
-                            self.select(cx, index);
-                            if matches!(self.tree.nodes[index].kind, Kind::Ghost { .. }) {
-                                self.expand(cx, index);
-                            } else if drag.taps >= 2 {
-                                self.fly_to_node(cx, index);
-                            }
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
-        if self.cam_scale <= 0.0 {
-            return;
-        }
-        self.handle_input(cx, hit);
-    }
+    links
 }
 
-// `CodeMapRef` is generated by `#[derive(Widget)]`: a handle the app uses to
-// reach this widget from outside.
-impl CodeMapRef {
-    pub fn set_evidence_input(&self, cx: &mut Cx, input: EvidenceInput) {
-        if let Some(mut inner) = self.borrow_mut() { inner.set_evidence_input(cx, input); }
+fn draw_call_strips(canvas: &mut Canvas, view: Rect, marks: &[CallMark], root: Option<&str>, pos: DVec2, char_width: f64, line_height: f64, fade: f32) -> usize {
+    let mut count = 0;
+    for mark in marks {
+        let start = mark.start.min(COL_CHARS as usize);
+        let end = mark.end.min(COL_CHARS as usize);
+        if end <= start { continue; }
+        let [r, g, b] = call_colors::file_rgb(&mark.target, root);
+        block(canvas, view, Rect { pos: pos + dvec2(start as f64 * char_width, line_height * 0.18), size: dvec2((end - start) as f64 * char_width, (line_height * 0.64).max(0.5)) }, vec4(r * fade, g * fade, b * fade, 1.0), [0.0; 4], 0.0, 0.0);
+        count += 1;
     }
-    pub fn set_evidence_mode(&self, cx: &mut Cx, mode: usize) {
-        if let Some(mut inner) = self.borrow_mut() { inner.set_evidence_mode(cx, mode); }
-    }
-    pub fn is_loading(&self) -> bool {
-        self.borrow().is_some_and(|inner| inner.pending > 0)
-    }
-    pub fn set_syntax_colors(&self, cx: &mut Cx, on: bool) {
-        if let Some(mut inner) = self.borrow_mut() { inner.set_syntax_colors(cx, on); }
-    }
-    pub fn set_filter(&self, cx: &mut Cx, query: &str) {
-        if let Some(mut inner) = self.borrow_mut() { inner.set_filter(cx, query); }
-    }
-    pub fn set_hide_tests(&self, cx: &mut Cx, hide: bool) {
-        if let Some(mut inner) = self.borrow_mut() { inner.set_hide_tests(cx, hide); }
-    }
-    pub fn set_relationship_mode(&self, cx: &mut Cx, mode: usize) {
-        if let Some(mut inner) = self.borrow_mut() { inner.set_relationship_mode(cx, mode); }
-    }
-    pub fn set_relationship_depth(&self, cx: &mut Cx, depth: usize) {
-        if let Some(mut inner) = self.borrow_mut() { inner.set_relationship_depth(cx, depth); }
-    }
-    pub fn trace_selected(&self, cx: &mut Cx) {
-        if let Some(mut inner) = self.borrow_mut() { inner.trace_selected(cx); }
-    }
-    pub fn open(&self, cx: &mut Cx, root: PathBuf) {
-        if let Some(mut inner) = self.borrow_mut() {
-            inner.open(cx, root);
-        }
-    }
-    pub fn set_show_ignored(&self, cx: &mut Cx, show: bool) {
-        if let Some(mut inner) = self.borrow_mut() {
-            inner.set_show_ignored(cx, show);
-        }
-    }
-    pub fn fit(&self, cx: &mut Cx) {
-        if let Some(mut inner) = self.borrow_mut() {
-            inner.fit(cx);
-        }
-    }
-    pub fn set_color_mode(&self, cx: &mut Cx, mode: ColorMode) {
-        if let Some(mut inner) = self.borrow_mut() {
-            inner.set_color_mode(cx, mode);
-        }
-    }
-    pub fn set_search(&self, cx: &mut Cx, query: &str) {
-        if let Some(mut inner) = self.borrow_mut() {
-            inner.set_search(cx, query);
-        }
-    }
-    pub fn next_match(&self, cx: &mut Cx) {
-        if let Some(mut inner) = self.borrow_mut() {
-            inner.next_match(cx);
-        }
-    }
+    count
+}
+
+fn block(canvas: &mut Canvas, view: Rect, rect: Rect, color: Vec4f, edge: Vec4f, border: f32, hatch: f32) {
+    canvas.rect(rect.into(), color, edge, border, hatch, view.into());
 }
 
 fn short_label(text: &str, max: usize) -> String {
@@ -1360,35 +1138,6 @@ fn target_description(target: &CallTarget) -> String {
     }
 }
 
-fn draw_source_line(draw: &mut DrawText, cx: &mut Cx2d, line: &crate::syntax::HighlightedLine, marks: &[CallMark], root: Option<&str>, syntax: bool, pos: DVec2, line_height: f64, fade: f32) -> Vec<CallLink> {
-    let ranges = call_colors::link_ranges(marks, line.text.chars().count().min(COL_CHARS as usize));
-    let mut links = Vec::new();
-    let mut x = pos.x;
-    let mut column = 0;
-    for run in call_colors::paint_line(line, marks, root, syntax, COL_CHARS as usize) {
-        let [r, g, b] = run.color;
-        draw.color = vec4(r * fade, g * fade, b * fade, 1.0);
-        let width = source_text_width(draw, cx.cx, run.text);
-        let end = column + run.text.chars().count();
-        for range in &ranges {
-            let (start, stop) = (range.start.max(column), range.end.min(end));
-            if stop <= start { continue; }
-            let prefix = run.text.char_indices().nth(start - column).map_or(run.text.len(), |(i, _)| i);
-            let suffix = run.text.char_indices().nth(stop - column).map_or(run.text.len(), |(i, _)| i);
-            let left = source_text_width(draw, cx.cx, &run.text[..prefix]);
-            let right = source_text_width(draw, cx.cx, &run.text[..suffix]);
-            links.push(CallLink {
-                rect: Rect { pos: dvec2(x + left, pos.y), size: dvec2(right - left, line_height) },
-                target: CallTarget { definition: range.definition.clone(), inference: range.inference.map(str::to_owned), evidence: range.evidence },
-            });
-        }
-        draw.draw_abs(cx, dvec2(x, pos.y), run.text);
-        x += width;
-        column = end;
-    }
-    links
-}
-
 fn capture_source_anchor(tree: &Tree, view: Rect, offset: DVec2, scale: f64) -> Option<SourceAnchor> {
     if scale <= 0.0 || !scale.is_finite() { return None; }
     let center = offset + view.size * 0.5 / scale;
@@ -1423,34 +1172,6 @@ fn definition_camera(line: R, indent: usize, length: usize, view: DVec2) -> (DVe
     (dvec2(start + width.min(view.x / scale * 0.8) * 0.5, line.y + line.h * 0.5), scale)
 }
 
-fn source_text_width(draw: &DrawText, cx: &mut Cx, text: &str) -> f64 {
-    if text.is_empty() { return 0.0; }
-    draw.layout(cx, 0.0, 0.0, None, false, Align::default(), text)
-        .rows.first().map_or(0.0, |row| row.width_in_lpxs as f64)
-}
-
-fn draw_call_strips(draw: &mut DrawBlock, cx: &mut Cx2d, marks: &[CallMark], root: Option<&str>, pos: DVec2, char_width: f64, line_height: f64, fade: f32) -> usize {
-    let mut count = 0;
-    for mark in marks {
-        let start = mark.start.min(COL_CHARS as usize);
-        let end = mark.end.min(COL_CHARS as usize);
-        if end <= start { continue; }
-        let [r, g, b] = call_colors::file_rgb(&mark.target, root);
-        block(draw, cx, Rect { pos: pos + dvec2(start as f64 * char_width, line_height * 0.18), size: dvec2((end - start) as f64 * char_width, (line_height * 0.64).max(0.5)) }, vec4(r * fade, g * fade, b * fade, 1.0), vec4(0.0, 0.0, 0.0, 0.0), 0.0, 0.0);
-        count += 1;
-    }
-    count
-}
-
-fn block(draw: &mut DrawBlock, cx: &mut Cx2d, rect: Rect, color: Vec4f, edge: Vec4f, border: f32, hatch: f32) {
-    draw.color = color;
-    draw.edge = edge;
-    draw.border = border;
-    draw.hatch = hatch;
-    draw.draw_abs(cx, rect);
-}
-
-/// A stable color per file extension, with hand-picked ones for common types.
 fn ext_hue(name: &str) -> f32 {
     let ext = name.rsplit_once('.').map(|(_, e)| e).unwrap_or("");
     match ext {
@@ -1470,8 +1191,6 @@ fn ext_hue(name: &str) -> f32 {
     }
 }
 
-/// Heatmap ramp: cold blue, through magenta and orange, to hot yellow.
-/// Grey when a file has no git history.
 fn heat_color(heat: f32) -> Vec4f {
     if heat < 0.0 {
         return vec4(0.30, 0.30, 0.32, 1.0);
@@ -1493,7 +1212,7 @@ fn hsv(h: f32, s: f32, v: f32) -> Vec4f {
 }
 
 fn scale_rgb(c: Vec4f, k: f32) -> Vec4f {
-    vec4(c.x * k, c.y * k, c.z * k, c.w)
+    vec4(c[0] * k, c[1] * k, c[2] * k, c[3])
 }
 
 pub fn fmt_num(n: u64) -> String {
@@ -1595,6 +1314,74 @@ mod navigation_tests {
         tree.layout(world);
         assert!(restore_source_anchor(&tree, anchor).is_none());
         assert!(capture_source_anchor(&tree, view, offset, 0.0).is_none());
+    }
+
+    fn controller() -> Map {
+        let mut map = Map::empty();
+        for path in ["a.rb", "b.rb"] {
+            map.tree.insert(Entry { path: path.into(), kind: crate::scan::EntryKind::Text {
+                bytes: 20, lines: vec![crate::scan::Line { indent: 0, len: 8, comment: false }; 20],
+            }, ignored: false });
+        }
+        map.view = R { x: 40.0, y: 100.0, w: 800.0, h: 600.0 }.into();
+        map.relayout();
+        map.needs_fit = false;
+        map.dirty = false;
+        map
+    }
+
+    #[test]
+    fn pointer_links_follow_only_primary_unmodified_clicks_and_stay_inside_the_map() {
+        let mut map = controller();
+        let target = CallTarget { definition: SymbolRef { file: "b.rb".into(), name: "B#run".into(), line: 4 }, inference: None, evidence: EvidenceKind::Source };
+        let rect = R { x: 70.0, y: 140.0, w: 60.0, h: 20.0 };
+        map.call_links.push(CallLink { rect, target: target.clone() });
+        assert!(map.has_link_at(80.0, 150.0));
+        assert!(!map.has_link_at(80.0, 99.0));
+        map.pointer_down(80.0, 150.0, 1, 1);
+        map.pointer_up(80.0, 150.0, 1);
+        assert!(map.definition_focus.is_none());
+        map.pointer_down_with_modifiers(80.0, 150.0, 0, 1, crate::platform::SHIFT);
+        map.pointer_up(80.0, 150.0, 0);
+        assert!(map.definition_focus.is_none());
+        map.pointer_down(80.0, 150.0, 0, 1);
+        map.pointer_up(80.0, 150.0, 0);
+        assert_eq!(map.definition_focus, Some(target));
+        assert_eq!(map.selected, map.tree.find("b.rb"));
+        assert!(map.flight.is_some());
+    }
+
+    #[test]
+    fn dragging_cancels_a_link_click_and_zoom_preserves_the_pointer_anchor() {
+        let mut map = controller();
+        let start = map.cam_off;
+        map.pointer_down(80.0, 150.0, 0, 1);
+        map.pointer_move(100.0, 180.0);
+        map.pointer_up(100.0, 180.0, 0);
+        assert_eq!(map.cam_off, start - dvec2(20.0, 30.0));
+        assert!(map.selected.is_none());
+        let point = dvec2(180.0, 220.0);
+        let anchor = map.to_world(point);
+        let scale = map.cam_scale;
+        map.scroll(point.x, point.y, -80.0);
+        assert!(map.cam_scale > scale);
+        assert!((map.to_world(point) - anchor).length() < 1e-8);
+        let zoomed = map.cam_scale;
+        map.scroll(10.0, 10.0, -80.0);
+        map.scroll(point.x, point.y, f64::NAN);
+        assert_eq!(map.cam_scale, zoomed);
+    }
+
+    #[test]
+    fn invalid_filter_retains_the_last_valid_selection_and_reports_the_draft_error() {
+        let mut map = controller();
+        map.set_filter("a.rb");
+        assert!(map.tree.is_visible(map.tree.find("a.rb").unwrap()));
+        assert!(!map.tree.is_visible(map.tree.find("b.rb").unwrap()));
+        map.set_filter("(");
+        assert!(map.status().starts_with("Filter error:"));
+        assert!(map.tree.is_visible(map.tree.find("a.rb").unwrap()));
+        assert!(!map.tree.is_visible(map.tree.find("b.rb").unwrap()));
     }
 
     #[test]
