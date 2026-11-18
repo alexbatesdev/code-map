@@ -1,4 +1,4 @@
-use crate::{relationships::{CallEdge, SymbolRef}, syntax::HighlightedLine};
+use crate::{evidence::EvidenceKind, relationships::{CallEdge, SymbolRef}, syntax::HighlightedLine};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 pub const PLAIN: [f32; 3] = [0.79, 0.82, 0.86];
@@ -10,6 +10,7 @@ pub struct CallMark {
     pub target: String,
     pub definition: SymbolRef,
     pub inference: Option<String>,
+    pub evidence: EvidenceKind,
 }
 
 #[derive(Default)]
@@ -26,13 +27,14 @@ impl CallHighlights {
             result.files.entry(edge.caller.file.clone()).or_default().entry(edge.line).or_default().push(CallMark {
                 start: edge.start_column, end: edge.end_column, target: edge.callee.file.clone(), definition: edge.callee.clone(),
                 inference: edge.inference.clone(),
+                evidence: edge.evidence,
             });
         }
         for lines in result.files.values_mut() {
             for marks in lines.values_mut() {
-                marks.sort_by(|a, b| (a.start, a.end, &a.target, &a.definition.name, &a.definition.file, a.definition.line, &a.inference)
-                    .cmp(&(b.start, b.end, &b.target, &b.definition.name, &b.definition.file, b.definition.line, &b.inference)));
-                marks.dedup();
+                marks.sort_by(|a, b| (a.start, a.end, &a.target, &a.definition.name, &a.definition.file, a.definition.line, std::cmp::Reverse(a.evidence), &a.inference)
+                    .cmp(&(b.start, b.end, &b.target, &b.definition.name, &b.definition.file, b.definition.line, std::cmp::Reverse(b.evidence), &b.inference)));
+                marks.dedup_by(|a, b| a.start == b.start && a.end == b.end && a.definition == b.definition);
             }
         }
         result
@@ -47,7 +49,11 @@ impl CallHighlights {
     }
 
     pub fn inferred_site_count(&self) -> usize {
-        self.files.values().flat_map(|lines| lines.values()).flatten().filter(|mark| mark.inference.is_some()).count()
+        self.evidence_site_count(EvidenceKind::Inferred)
+    }
+
+    pub fn evidence_site_count(&self, kind: EvidenceKind) -> usize {
+        self.files.values().flat_map(|lines| lines.values()).flatten().filter(|mark| mark.evidence == kind).count()
     }
 
     pub fn connections(&self, file: &str) -> Vec<(usize, &CallMark)> {
@@ -62,6 +68,7 @@ pub struct LinkRange<'a> {
     pub end: usize,
     pub definition: &'a SymbolRef,
     pub inference: Option<&'a str>,
+    pub evidence: EvidenceKind,
 }
 
 fn marked_columns(marks: &[CallMark], columns: usize) -> (Vec<Option<&CallMark>>, Vec<bool>) {
@@ -72,7 +79,7 @@ fn marked_columns(marks: &[CallMark], columns: usize) -> (Vec<Option<&CallMark>>
             if result[column].is_some_and(|previous| previous.definition != mark.definition) {
                 ambiguous[column] = true;
             }
-            if result[column].is_some_and(|previous| previous.definition == mark.definition && previous.inference.is_some() && mark.inference.is_none()) {
+            if result[column].is_some_and(|previous| previous.definition == mark.definition && (previous.evidence > mark.evidence || (previous.evidence == mark.evidence && previous.inference.is_some() && mark.inference.is_none()))) {
                 continue;
             }
             result[column] = Some(mark);
@@ -91,10 +98,10 @@ pub fn link_ranges(marks: &[CallMark], columns: usize) -> Vec<LinkRange<'_>> {
     let mut result: Vec<LinkRange<'_>> = Vec::new();
     for (column, mark) in marked.into_iter().enumerate() {
         let Some(mark) = mark else { continue };
-        if let Some(previous) = result.last_mut().filter(|previous| previous.end == column && *previous.definition == mark.definition && previous.inference == mark.inference.as_deref()) {
+        if let Some(previous) = result.last_mut().filter(|previous| previous.end == column && *previous.definition == mark.definition && previous.inference == mark.inference.as_deref() && previous.evidence == mark.evidence) {
             previous.end = column + 1;
         } else {
-            result.push(LinkRange { start: column, end: column + 1, definition: &mark.definition, inference: mark.inference.as_deref() });
+            result.push(LinkRange { start: column, end: column + 1, definition: &mark.definition, inference: mark.inference.as_deref(), evidence: mark.evidence });
         }
     }
     result
@@ -168,7 +175,7 @@ mod tests {
     use crate::syntax::HighlightedText;
 
     fn mark(start: usize, end: usize, file: &str, name: &str, line: usize) -> CallMark {
-        CallMark { start, end, target: file.into(), definition: SymbolRef { name: name.into(), file: file.into(), line }, inference: None }
+        CallMark { start, end, target: file.into(), definition: SymbolRef { name: name.into(), file: file.into(), line }, inference: None, evidence: EvidenceKind::Source }
     }
 
     #[test]
@@ -196,7 +203,7 @@ mod tests {
     #[test]
     fn hidden_targets_and_same_file_calls_have_no_color_marks() {
         let symbol = |file: &str| SymbolRef { name: "run".into(), file: file.into(), line: 1 };
-        let edge = |target: &str| CallEdge { caller: symbol("a.ts"), callee: symbol(target), line: 1, start_column: 0, end_column: 3, inference: None };
+        let edge = |target: &str| CallEdge { caller: symbol("a.ts"), callee: symbol(target), line: 1, start_column: 0, end_column: 3, inference: None, evidence: EvidenceKind::Source };
         let visible = HashSet::from(["a.ts".into(), "b.ts".into()]);
         let marks = CallHighlights::new(&[edge("b.ts"), edge("b.ts"), edge("hidden.ts"), edge("a.ts")], &visible);
         assert_eq!(marks.site_count(), 1);
@@ -227,13 +234,13 @@ mod tests {
         let caller = SymbolRef { name: "caller".into(), file: "a.ts".into(), line: 1 };
         let first = mark(0, 3, "b.ts", "run", 4);
         let second = mark(0, 3, "b.ts", "run", 8);
-        let edge = |mark: &CallMark| CallEdge { caller: caller.clone(), callee: mark.definition.clone(), line: 2, start_column: mark.start, end_column: mark.end, inference: mark.inference.clone() };
+        let edge = |mark: &CallMark| CallEdge { caller: caller.clone(), callee: mark.definition.clone(), line: 2, start_column: mark.start, end_column: mark.end, inference: mark.inference.clone(), evidence: mark.evidence };
         let visible = HashSet::from(["a.ts".into(), "b.ts".into()]);
         let highlights = CallHighlights::new(&[edge(&first), edge(&second), edge(&first)], &visible);
         assert_eq!(highlights.site_count(), 2);
         assert!(link_ranges(highlights.line("a.ts", 2), 3).is_empty());
         let marks = [first.clone(), first];
-        assert_eq!(link_ranges(&marks, 3), vec![LinkRange { start: 0, end: 3, definition: &marks[0].definition, inference: None }]);
+        assert_eq!(link_ranges(&marks, 3), vec![LinkRange { start: 0, end: 3, definition: &marks[0].definition, inference: None, evidence: EvidenceKind::Source }]);
     }
 
     #[test]
@@ -241,11 +248,11 @@ mod tests {
         let text = HighlightedText::new("a.rb", "\té = B.run");
         let marks = [mark(10, 13, "b.rb", "run", 4), mark(11, 12, "b.rb", "other", 8), mark(2, 2, "b.rb", "empty", 1), mark(8, 3, "b.rb", "backward", 1)];
         let ranges = link_ranges(&marks, 12);
-        assert_eq!(ranges, vec![LinkRange { start: 10, end: 11, definition: &marks[0].definition, inference: None }]);
+        assert_eq!(ranges, vec![LinkRange { start: 10, end: 11, definition: &marks[0].definition, inference: None, evidence: EvidenceKind::Source }]);
         assert_eq!(text.lines[0].text.chars().skip(ranges[0].start).take(ranges[0].end - ranges[0].start).collect::<String>(), "r");
         assert!(link_ranges(&marks, 10).is_empty());
         assert!(link_ranges(&marks, 0).is_empty());
-        assert_eq!(link_ranges(&marks, 13), vec![LinkRange { start: 10, end: 11, definition: &marks[0].definition, inference: None }, LinkRange { start: 12, end: 13, definition: &marks[0].definition, inference: None }]);
+        assert_eq!(link_ranges(&marks, 13), vec![LinkRange { start: 10, end: 11, definition: &marks[0].definition, inference: None, evidence: EvidenceKind::Source }, LinkRange { start: 12, end: 13, definition: &marks[0].definition, inference: None, evidence: EvidenceKind::Source }]);
     }
 
     #[test]
@@ -254,7 +261,7 @@ mod tests {
         let caller = SymbolRef { name: "caller".into(), file: "a.rb".into(), line: 1 };
         let edge = |file: &str, inference: Option<&str>| CallEdge {
             caller: caller.clone(), callee: SymbolRef { name: "run".into(), file: file.into(), line: 8 },
-            line: 1, start_column: 0, end_column: 3, inference: inference.map(str::to_owned),
+            line: 1, start_column: 0, end_column: 3, inference: inference.map(str::to_owned), evidence: if inference.is_some() { EvidenceKind::Inferred } else { EvidenceKind::Source },
         };
         let visible = HashSet::from(["a.rb".into(), "b.rb".into()]);
         let highlights = CallHighlights::new(&[edge("b.rb", Some(reason)), edge("hidden.rb", Some(reason)), edge("a.rb", Some(reason))], &visible);
@@ -275,9 +282,29 @@ mod tests {
     fn inferred_alternative_definitions_remain_neutral_and_unclickable() {
         let mut inferred = mark(7, 10, "b.rb", "run", 8);
         inferred.inference = Some("Inferred receiver type".into());
+        inferred.evidence = EvidenceKind::Inferred;
         let marks = [mark(7, 10, "b.rb", "run", 4), inferred];
         let text = HighlightedText::new("a.rb", "return run()");
         assert!(link_ranges(&marks, 100).is_empty());
         assert!(paint_line(&text.lines[0], &marks, None, true, 100).iter().any(|run| run.text == "run" && run.color == PLAIN));
+    }
+
+    #[test]
+    fn observed_provenance_counts_one_site_and_keeps_ambiguous_definitions_unclickable() {
+        let caller = SymbolRef { name: "caller".into(), file: "a.rb".into(), line: 1 };
+        let edge = |kind, file: &str| CallEdge {
+            caller: caller.clone(), callee: SymbolRef { name: "run".into(), file: file.into(), line: 8 },
+            line: 2, start_column: 0, end_column: 3,
+            inference: (kind != EvidenceKind::Source).then(|| "capture example".into()), evidence: kind,
+        };
+        let visible = HashSet::from(["a.rb".into(), "b.rb".into(), "c.rb".into()]);
+        let observed = edge(EvidenceKind::Observed, "b.rb");
+        let marks = CallHighlights::new(&[edge(EvidenceKind::Source, "b.rb"), observed.clone()], &visible);
+        assert_eq!(marks.site_count(), 1);
+        assert_eq!(marks.inferred_site_count(), 0);
+        assert_eq!(marks.evidence_site_count(EvidenceKind::Observed), 1);
+        assert_eq!(link_ranges(marks.line("a.rb", 2), 20)[0].evidence, EvidenceKind::Observed);
+        let ambiguous = CallHighlights::new(&[observed, edge(EvidenceKind::Inferred, "c.rb")], &visible);
+        assert!(link_ranges(ambiguous.line("a.rb", 2), 20).is_empty());
     }
 }

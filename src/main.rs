@@ -6,10 +6,13 @@
 pub use makepad_widgets;
 
 mod history;
+mod evidence;
+mod evidence_input;
 mod call_colors;
 mod filter;
 mod relationships;
 mod syntax;
+mod source_cache;
 mod map_view;
 mod model;
 mod scan;
@@ -99,6 +102,20 @@ script_mod! {
                         }
                         relationship_root := InfoLabel{width: Fill text: "Select a source file to trace its calls"}
                         InfoLabel{text: "Call colors match files · Inference reasons in inspector"}
+                    }
+                    evidence := View{
+                        width: Fill height: 38 flow: Right spacing: 8
+                        padding: Inset{left: 12, right: 12}
+                        align: Align{y: 0.5}
+                        evidence_path := TextInput{width: 280 height: 28 empty_text: "Optional evidence snapshot.json"}
+                        evidence_load := Button{text: "Load snapshot"}
+                        evidence_capture := Button{text: "Capture Rails"}
+                        evidence_clear := Button{text: "Static only"}
+                        evidence_mode := DropDown{
+                            width: 175
+                            labels: ["All evidence" "Source only" "Static + inferred" "Loaded app only" "Observed only"]
+                        }
+                        evidence_status := InfoLabel{width: Fill text: "Static analysis; optional app data is off"}
                     }
                     View{
                         width: Fill height: Fill
@@ -191,10 +208,27 @@ impl MatchEvent for App {
         self.ui.label(cx, ids!(title)).set_text(cx, &format!("megamap: {}", path.display()));
         let map = self.ui.code_map(cx, ids!(map));
         map.open(cx, path);
+        if let Some(path) = std::env::args().find_map(|arg| arg.strip_prefix("--evidence=").map(PathBuf::from)) {
+            self.ui.text_input(cx, ids!(evidence_path)).set_text(cx, &path.to_string_lossy());
+            map.set_evidence_input(cx, evidence_input::EvidenceInput::File(path));
+        }
     }
 
     fn handle_actions(&mut self, cx: &mut Cx, actions: &Actions) {
         let map = self.ui.code_map(cx, ids!(map));
+        if self.ui.button(cx, ids!(evidence_load)).clicked(actions) {
+            let path = self.ui.text_input(cx, ids!(evidence_path)).text();
+            map.set_evidence_input(cx, evidence_input::EvidenceInput::File(PathBuf::from(path)));
+        }
+        if self.ui.button(cx, ids!(evidence_capture)).clicked(actions) {
+            map.set_evidence_input(cx, evidence_input::EvidenceInput::Rails);
+        }
+        if self.ui.button(cx, ids!(evidence_clear)).clicked(actions) {
+            map.set_evidence_input(cx, evidence_input::EvidenceInput::Static);
+        }
+        if let Some(mode) = self.ui.drop_down(cx, ids!(evidence_mode)).changed(actions) {
+            map.set_evidence_mode(cx, mode);
+        }
         if self.ui.button(cx, ids!(fit_button)).clicked(actions) {
             map.fit(cx);
         }
@@ -247,6 +281,7 @@ impl MatchEvent for App {
             }
             match wa.cast::<CodeMapAction>() {
                 CodeMapAction::Status(text) => self.ui.label(cx, ids!(status)).set_text(cx, &text),
+                CodeMapAction::EvidenceStatus(text) => self.ui.label(cx, ids!(evidence_status)).set_text(cx, &text),
                 CodeMapAction::Root(text, mode) => {
                     self.ui.label(cx, ids!(relationship_root)).set_text(cx, &text);
                     self.ui.drop_down(cx, ids!(relationship_mode)).set_selected_item(cx, mode);
@@ -270,6 +305,7 @@ impl AppMain for App {
     }
 
     fn handle_event(&mut self, cx: &mut Cx, event: &Event) {
+        if matches!(event, Event::Shutdown | Event::WindowClosed(_)) { evidence_input::cancel_capture(); }
         self.match_event(cx, event);
         self.ui.handle_event(cx, event, &mut Scope::empty());
         let loading = self.ui.code_map(cx, ids!(map)).is_loading();

@@ -42,6 +42,14 @@ original map. The viewer uses a zoomable 2D treemap.
 - **Loading:** a gold Triforce pulses in the bottom-right corner while background
   scans, history, call indexing, folder expansion or source loading are pending.
   It disappears when all pending work finishes.
+- **Optional app evidence:** normal startup uses source analysis without starting
+  Rails. Load an evidence JSON file, or explicitly choose **Capture Rails** to
+  inspect this repository's development app. Capture runs in the background with
+  a 45-second limit; missing apps, failed captures and invalid snapshots fall
+  back to source analysis. **Static only** removes optional data. Evidence
+  filters distinguish source, inferred, loaded-app-assisted and observed calls.
+  Importing a new snapshot refreshes the indexed source text and clears old
+  navigation evidence while preserving the current source viewport.
 
 Call paths traverse method/function symbols before grouping them into files.
 If A calls `B.run`, and only the unrelated `B.other` calls C, A does not acquire
@@ -65,6 +73,51 @@ from non-ignored supported source files in the original scan.
 The original setup instructions below still apply. Build and test the fork with
 `cargo build --release --bins --locked` and `cargo test --release --locked`.
 
+## Optional Rails metadata and observed calls
+
+The viewer works without Rails. A loaded-app snapshot can reveal generated
+methods, effective mixin method owners, actual associations and attributes.
+Loaded-app-assisted links remain candidate calls; they are not execution proof.
+**Capture Rails** explicitly runs `bin/rails runner` in development with Spring
+disabled. It does not attach to or require an already running web server. App
+dependencies must already be installed; megamap never installs them.
+Capture uses the viewer's Ruby environment and the sibling `megamap-capture`
+helper built by `cargo build --release --bins`. For an app managed by a container
+or version manager, export in that environment and import the snapshot.
+
+To export inside a different environment, such as a container, run from that
+application's root:
+
+```sh
+MEGAMAP_EVIDENCE_MODE=snapshot MEGAMAP_EVIDENCE_OUT=/tmp/megamap-loaded.json \
+  bin/rails runner /absolute/path/to/megamap/tools/runtime_evidence.rb
+```
+
+Load the resulting JSON using **Load snapshot**, or launch with
+`--evidence=/absolute/path/to/snapshot.json`. Relative snapshot paths in the
+viewer are relative to the mapped repository. Snapshots use relative source
+paths and content fingerprints, so matching container/host checkouts work.
+Changed, added, deleted or unavailable Ruby context files invalidate the capture
+and retain source analysis. Reopen the project when files are added or removed.
+
+To record a chosen local request or test, explicitly wrap that behavior in an
+already loaded Ruby/Rails process:
+
+```ruby
+require "/absolute/path/to/megamap/tools/runtime_evidence"
+MegamapEvidence.capture(root: Rails.root, output: "/tmp/megamap-observed.json", label: "chosen scenario") do
+  # Run the selected development request or test here.
+end
+```
+
+Requiring the helper alone is inert. Captures record method identities, source
+locations and counts, without arguments or local values. Observations cover only
+the exercised execution. C, external-framework and block frames are barriers;
+callbacks or background-job causality are not collapsed into invented direct
+calls. Collection limits and partial metadata warnings accompany the capture.
+Ambiguous same-line call tokens remain unlinked. Test the helper with
+`ruby tests/runtime_evidence_test.rb` in addition to the Rust suite.
+
 Fly over a codebase as a zoomable GPU treemap. Based on
 [Code Map](https://github.com/Peeter95/code-map).
 
@@ -84,7 +137,7 @@ You need Rust (https://rustup.rs) and a Makepad checkout **next to** this repo, 
 mkdir megamap && cd megamap
 git clone https://github.com/makepad/makepad.git
 git -C makepad checkout a4ea2536a4ab223fb31e0282be923191230f44fe   # dev branch, 2026-09-15
-git clone --branch alex/ruby-receiver-inference https://github.com/alexbatesdev/code-map.git
+git clone --branch alex/runtime-evidence https://github.com/alexbatesdev/code-map.git
 ```
 
 Makepad's API moves fast, so stick to the pinned commit above. Newer commits may or may not

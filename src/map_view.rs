@@ -7,15 +7,18 @@
 use crate::history::{self, History};
 use crate::call_colors::{self, CallHighlights, CallMark};
 use crate::filter::Filter;
+use crate::evidence::{EvidenceFilter, EvidenceKind};
+use crate::evidence_input::{self, EvidenceInput};
 use crate::relationships::{supports_path, CallEdge, Direction, Graph, Reachability, SourceFile, SymbolRef};
 use crate::syntax::HighlightedText;
+use crate::source_cache::{self, SourceCache};
 use crate::model::{code_inner, frame, ColorMode, Kind, Tree, CHAR_W, COL_CHARS, R};
 use crate::scan::{self, Entry};
 use makepad_widgets::*;
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::HashMap,
     path::PathBuf,
-    sync::mpsc::{channel, sync_channel, Receiver, Sender, SyncSender},
+    sync::{Arc, mpsc::{channel, sync_channel, Receiver, Sender, SyncSender}},
     time::Instant,
 };
 
@@ -117,15 +120,28 @@ pub enum CodeMapAction {
     Selected(NodeInfo),
     Status(String),
     Root(String, usize),
+    EvidenceStatus(String),
 }
 
 enum ScanMsg {
     Project(Result<scan::ProjectScan, String>, f64),
     Expanded(String, Vec<Entry>),
     History(Result<History, String>),
-    Graph(Graph, usize),
-    Text(usize, HighlightedText),
+    Graph(GraphUpdate),
+    Text(u64, usize, HighlightedText),
 }
+
+struct GraphUpdate {
+    generation: u64,
+    graph: Graph,
+    read_errors: usize,
+    status: String,
+    view: ViewUpdate,
+    entries: Vec<Entry>,
+    source_texts: HashMap<String, Arc<String>>,
+}
+
+type TextRequest = (u64, usize, PathBuf, String, Option<Arc<String>>);
 
 struct Label {
     rect: Rect,
@@ -142,6 +158,7 @@ struct CallLink {
 struct CallTarget {
     definition: SymbolRef,
     inference: Option<String>,
+    evidence: EvidenceKind,
 }
 
 #[derive(Clone, Copy)]
@@ -240,6 +257,16 @@ pub struct CodeMap {
     #[rust]
     graph_read_errors: usize,
     #[rust]
+    graph_generation: u64,
+    #[rust]
+    evidence_input: EvidenceInput,
+    #[rust]
+    evidence_mode: usize,
+    #[rust]
+    evidence_status: String,
+    #[rust]
+    scan_ready: bool,
+    #[rust]
     reachable: Option<Reachability>,
     #[rust]
     matches: Vec<usize>,
@@ -255,15 +282,9 @@ pub struct CodeMap {
     frame: NextFrame,
     /// File contents for the fully zoomed-in view, loaded on demand.
     #[rust]
-    text_cache: HashMap<usize, HighlightedText>,
+    content: SourceCache,
     #[rust]
-    text_worker: Option<SyncSender<(usize, PathBuf, String)>>,
-    #[rust]
-    text_pending: HashSet<usize>,
-    #[rust]
-    text_order: VecDeque<usize>,
-    #[rust]
-    text_bytes: usize,
+    text_worker: Option<SyncSender<TextRequest>>,
     #[rust]
     message: String,
     #[rust]
@@ -283,27 +304,30 @@ impl CodeMap {
         self.history = None;
         self.graph = None;
         self.graph_loading = false;
+        self.graph_generation = 0;
+        self.evidence_input = EvidenceInput::Static;
+        self.evidence_status = "Static analysis; optional app data is off".into();
+        self.scan_ready = false;
         self.relationship_root = None;
         self.reachable = None;
         self.call_highlights = CallHighlights::default();
-        self.text_cache.clear();
-        self.text_pending.clear();
-        self.text_order.clear();
-        self.text_bytes = 0;
+        self.content.replace(HashMap::new());
         let (tx, rx) = channel();
         let worker_tx = tx.clone();
-        let (text_tx, text_rx) = sync_channel::<(usize, PathBuf, String)>(8);
+        let (text_tx, text_rx) = sync_channel::<TextRequest>(8);
         let result_tx = tx.clone();
         std::thread::spawn(move || {
-            while let Ok((index, path, relative)) = text_rx.recv() {
-                let bytes = std::fs::read(path).unwrap_or_default();
-                if result_tx.send(ScanMsg::Text(index, HighlightedText::from_bytes(&relative, &bytes))).is_err() { break; }
+            while let Ok((generation, index, path, relative, source)) = text_rx.recv() {
+                let text = if let Some(source) = source { HighlightedText::new(&relative, &source) }
+                    else { HighlightedText::from_bytes(&relative, &std::fs::read(path).unwrap_or_default()) };
+                if result_tx.send(ScanMsg::Text(generation, index, text)).is_err() { break; }
             }
         });
         self.text_worker = Some(text_tx);
         self.tx = Some(tx);
         self.rx = Some(rx);
         self.pending = 1;
+        cx.widget_action(self.uid, CodeMapAction::EvidenceStatus(self.evidence_status.clone()));
         self.set_status(cx, format!("Scanning {} ...", root.display()));
         // Scanning runs on a background thread so the window stays responsive.
         // `move` hands ownership of `root` and the sender to that thread.
@@ -350,6 +374,27 @@ impl CodeMap {
         self.redraw(cx);
     }
 
+    pub fn set_evidence_mode(&mut self, cx: &mut Cx, mode: usize) {
+        self.evidence_mode = mode.min(4);
+        let filter = evidence_filter(self.evidence_mode);
+        if self.definition_focus.as_ref().is_some_and(|target| !filter.allows(target.evidence)) { self.definition_focus = None; }
+        self.refresh_relationships(cx, ViewUpdate::Preserve);
+    }
+
+    pub fn set_evidence_input(&mut self, cx: &mut Cx, input: EvidenceInput) {
+        self.evidence_input = input;
+        self.definition_focus = None;
+        self.graph_generation = self.graph_generation.wrapping_add(1);
+        self.evidence_status = match &self.evidence_input {
+            EvidenceInput::Static => "Using static analysis; reindexing without app data…".into(),
+            EvidenceInput::File(_) => "Loading optional snapshot; existing information remains available…".into(),
+            EvidenceInput::Rails => "Capturing optional Rails metadata (45s limit); existing information remains available…".into(),
+        };
+        cx.widget_action(self.uid, CodeMapAction::EvidenceStatus(self.evidence_status.clone()));
+        self.refresh_relationships(cx, ViewUpdate::Preserve);
+        self.start_graph(cx);
+    }
+
     pub fn set_relationship_mode(&mut self, cx: &mut Cx, mode: usize) {
         self.relationship_mode = mode.min(2);
         if mode > 0 && self.relationship_root.is_none() {
@@ -394,11 +439,15 @@ impl CodeMap {
     }
 
     fn start_graph(&mut self, cx: &mut Cx) {
+        if self.graph_loading || !self.scan_ready { return; }
         let Some(tx) = self.tx.clone() else { return };
         let paths: Vec<String> = self.tree.nodes.iter()
             .filter(|node| node.kind == Kind::Text && !node.ignored && supports_path(&node.path))
             .map(|node| node.path.clone()).collect();
         let root = self.root.clone();
+        let input = self.evidence_input.clone();
+        let generation = self.graph_generation;
+        let view = if self.graph.is_some() { ViewUpdate::Preserve } else { ViewUpdate::Fit };
         self.graph_loading = true;
         self.pending += 1;
         std::thread::spawn(move || {
@@ -412,8 +461,13 @@ impl CodeMap {
             let base_url = std::fs::read_to_string(root.join("tsconfig.json")).ok()
                 .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
                 .and_then(|value| value.pointer("/compilerOptions/baseUrl").and_then(|v| v.as_str()).map(str::to_owned));
-            let graph = Graph::build(&sources, base_url.as_deref());
-            let _ = tx.send(ScanMsg::Graph(graph, read_errors));
+            let evidence = evidence_input::load(&root, &sources, &input);
+            let graph = match evidence.snapshot.as_ref() {
+                Some(snapshot) => Graph::build_with_snapshot(&sources, base_url.as_deref(), Some(snapshot)),
+                None => Graph::build(&sources, base_url.as_deref()),
+            };
+            let (entries, source_texts) = source_cache::prepare(sources);
+            let _ = tx.send(ScanMsg::Graph(GraphUpdate { generation, graph, read_errors, status: evidence.status, view, entries, source_texts }));
         });
         self.frame = cx.new_next_frame();
     }
@@ -421,7 +475,13 @@ impl CodeMap {
     fn refresh_relationships(&mut self, cx: &mut Cx, view: ViewUpdate) {
         self.reachable = if self.relationship_mode > 0 {
             self.graph.as_ref().zip(self.relationship_root.as_deref()).map(|(graph, root)| {
-                graph.related(root, if self.relationship_mode == 2 { Direction::Callers } else { Direction::Callees }, self.relationship_depth)
+                let direction = if self.relationship_mode == 2 { Direction::Callers } else { Direction::Callees };
+                if self.evidence_mode == 0 && !matches!(self.evidence_input, EvidenceInput::Static) { graph.related(root, direction, self.relationship_depth) }
+                else {
+                    let mut filter = evidence_filter(self.evidence_mode);
+                    if matches!(self.evidence_input, EvidenceInput::Static) { filter.loaded = false; filter.observed = false; }
+                    graph.related_filtered(root, direction, self.relationship_depth, filter)
+                }
             })
         } else { None };
         self.apply_selection(cx, view);
@@ -593,12 +653,12 @@ impl CodeMap {
         if self.relationship_mode > 0 {
             if let Some(reachable) = &self.reachable {
                 let visible = |path: &&String| self.tree.find(path).is_some_and(|index| self.tree.is_visible(index));
-                text.push_str(&format!(" · {} direct / {} indirect files · depth {}: {} reached methods / {} cross-file call sites ({} inferred)",
+                text.push_str(&format!(" · {} direct / {} indirect files · depth {}: {} reached methods / {} colored sites ({} inferred, {} loaded, {} observed)",
                     reachable.direct.iter().filter(visible).count(), reachable.indirect.iter().filter(visible).count(), self.relationship_depth,
-                    reachable.reached_symbols, self.call_highlights.site_count(), self.call_highlights.inferred_site_count()));
+                    reachable.reached_symbols, self.call_highlights.site_count(), self.call_highlights.inferred_site_count(), self.call_highlights.evidence_site_count(EvidenceKind::Loaded), self.call_highlights.evidence_site_count(EvidenceKind::Observed)));
             }
             if let Some(graph) = &self.graph {
-                text.push_str(&format!(" · {} unresolved sites / {} parse errors / {} unread files",
+                text.push_str(&format!(" · {} unresolved static sites / {} parse errors / {} unread files",
                     graph.unresolved_sites, graph.parse_errors, self.graph_read_errors));
             }
         }
@@ -613,6 +673,7 @@ impl CodeMap {
             self.pending = self.pending.saturating_sub(1);
             match msg {
                 ScanMsg::Project(Ok(project), secs) => {
+                    self.scan_ready = true;
                     let used_git = project.used_git;
                     for entry in project.entries {
                         self.tree.insert(entry);
@@ -628,6 +689,7 @@ impl CodeMap {
                     self.set_status(cx, text);
                     self.needs_layout = true;
                     self.needs_fit = true;
+                    if !matches!(self.evidence_input, EvidenceInput::Static) { self.start_graph(cx); }
                     if used_git {
                         // git history is slower than the scan, so load it separately
                         if let Some(tx) = self.tx.clone() {
@@ -660,23 +722,23 @@ impl CodeMap {
                 ScanMsg::History(Err(err)) => {
                     self.set_status(cx, format!("No git history: {err}"));
                 }
-                ScanMsg::Graph(graph, read_errors) => {
-                    self.graph = Some(graph);
+                ScanMsg::Graph(update) => {
                     self.graph_loading = false;
-                    self.graph_read_errors = read_errors;
-                    self.refresh_relationships(cx, ViewUpdate::Fit);
+                    if update.generation != self.graph_generation { self.start_graph(cx); continue; }
+                    self.source_anchor = if update.view == ViewUpdate::Preserve { capture_source_anchor(&self.tree, self.view, self.cam_off, self.cam_scale) } else { None };
+                    for entry in update.entries { self.tree.insert(entry); }
+                    self.content.replace(update.source_texts);
+                    self.definition_focus = None;
+                    self.call_links.clear();
+                    self.needs_layout = true;
+                    self.graph = Some(update.graph);
+                    self.graph_read_errors = update.read_errors;
+                    self.evidence_status = update.status;
+                    cx.widget_action(self.uid, CodeMapAction::EvidenceStatus(self.evidence_status.clone()));
+                    self.refresh_relationships(cx, update.view);
                 }
-                ScanMsg::Text(index, text) => {
-                    self.text_pending.remove(&index);
-                    self.text_bytes += text.lines.iter().map(|line| line.text.len()).sum::<usize>();
-                    self.text_cache.insert(index, text);
-                    self.text_order.push_back(index);
-                    while self.text_cache.len() > 64 || (self.text_bytes > 32 * 1024 * 1024 && self.text_cache.len() > 1) {
-                        let Some(oldest) = self.text_order.pop_front() else { break };
-                        if let Some(old) = self.text_cache.remove(&oldest) {
-                            self.text_bytes = self.text_bytes.saturating_sub(old.lines.iter().map(|line| line.text.len()).sum::<usize>());
-                        }
-                    }
+                ScanMsg::Text(generation, index, text) => {
+                    self.content.accept(generation, index, text);
                 }
             }
             self.redraw(cx);
@@ -787,6 +849,9 @@ impl CodeMap {
         if n.ignored && !matches!(n.kind, Kind::Ghost { .. }) {
             details.push_str("\n\nMatched by .gitignore");
         }
+        if !matches!(self.evidence_input, EvidenceInput::Static) {
+            details.push_str(&format!("\n\nOptional evidence\n{}", self.evidence_status));
+        }
         if self.relationship_mode > 0 && n.is_file() {
             if self.relationship_root.as_deref() == Some(n.path.as_str()) {
                 details.push_str("\n\nCall root: all methods in this file.\nDepth counts method-call hops;\ndeeper methods can stay in the\nsame files.");
@@ -798,10 +863,11 @@ impl CodeMap {
                         short_label(&edge.caller.name, 40), short_label(&edge.caller.file, 42), edge.line,
                         short_label(&edge.callee.name, 38), short_label(&edge.callee.file, 42), edge.callee.line));
                     if let Some(reason) = &edge.inference {
-                        details.push_str(&format!("\nInferred target: {reason}"));
+                        details.push_str(&format!("\n{}: {reason}", evidence_title(edge.evidence)));
                     }
+                    details.push_str(&format!("\nEvidence: {}", edge.evidence.label()));
                 }
-                details.push_str("\n\nStatic analysis; execution depends\non runtime inputs and dispatch.\nInferred targets are candidates.");
+                details.push_str("\n\nObserved calls apply to their capture.\nOther links describe possible execution.\nInferred targets are candidates.");
             }
             let connections = self.call_highlights.connections(&n.path);
             if !connections.is_empty() {
@@ -809,7 +875,7 @@ impl CodeMap {
                 for (line, mark) in connections.iter().take(16) {
                     details.push_str(&format!("\nL{}:{} → {}", line, mark.start + 1, short_label(&mark.target, 31)));
                     if let Some(reason) = &mark.inference {
-                        details.push_str(&format!("\nInferred target: {reason}"));
+                        details.push_str(&format!("\n{}: {reason}", evidence_title(mark.evidence)));
                     }
                 }
                 if connections.len() > 16 { details.push_str(&format!("\n…and {} more call sites", connections.len() - 16)); }
@@ -973,7 +1039,7 @@ impl CodeMap {
                     block(&mut self.draw_block, cx, line_rect, vec4(0.95, 0.73, 0.24, 0.12), vec4(0.95, 0.73, 0.24, 0.9), 1.5, 0.0);
                 }
                 if text_mode {
-                    if let Some(line) = self.text_cache.get(&index).and_then(|text| text.lines.get(k)) {
+                    if let Some(line) = self.content.files.get(&index).and_then(|text| text.lines.get(k)) {
                         self.call_links.extend(draw_source_line(&mut self.draw_code, cx, line, self.call_highlights.line(&node.path, k + 1), self.relationship_root.as_deref(), self.syntax_colors, dvec2(x, y), line_px, fade));
                     }
                 } else if line.len > 0 {
@@ -997,10 +1063,11 @@ impl CodeMap {
 
     /// Load a file's text for the fully zoomed-in view (cached).
     fn ensure_text(&mut self, cx: &mut Cx, index: usize) {
-        if self.text_cache.contains_key(&index) || self.text_pending.contains(&index) { return; }
+        if self.content.files.contains_key(&index) || self.content.pending.contains(&index) { return; }
         let relative = self.tree.nodes[index].path.clone();
-        if self.text_worker.as_ref().is_some_and(|tx| tx.try_send((index, self.root.join(&relative), relative)).is_ok()) {
-            self.text_pending.insert(index);
+        let source = self.content.originals.get(&relative).cloned();
+        if self.text_worker.as_ref().is_some_and(|tx| tx.try_send((self.content.generation, index, self.root.join(&relative), relative, source)).is_ok()) {
+            self.content.pending.insert(index);
             self.pending += 1;
             self.frame = cx.new_next_frame();
         }
@@ -1192,6 +1259,12 @@ impl Widget for CodeMap {
 // `CodeMapRef` is generated by `#[derive(Widget)]`: a handle the app uses to
 // reach this widget from outside.
 impl CodeMapRef {
+    pub fn set_evidence_input(&self, cx: &mut Cx, input: EvidenceInput) {
+        if let Some(mut inner) = self.borrow_mut() { inner.set_evidence_input(cx, input); }
+    }
+    pub fn set_evidence_mode(&self, cx: &mut Cx, mode: usize) {
+        if let Some(mut inner) = self.borrow_mut() { inner.set_evidence_mode(cx, mode); }
+    }
     pub fn is_loading(&self) -> bool {
         self.borrow().is_some_and(|inner| inner.pending > 0)
     }
@@ -1251,11 +1324,30 @@ fn short_label(text: &str, max: usize) -> String {
 }
 
 fn witness_label(chain: &[CallEdge]) -> &'static str {
-    match (chain.iter().any(|edge| edge.inference.is_some()), chain.len() == 1) {
-        (true, true) => "Inferred direct call",
-        (true, false) => "Inferred call path",
-        (false, true) => "Direct static call",
-        (false, false) => "Indirect static call path",
+    let observed = chain.iter().any(|edge| edge.evidence == EvidenceKind::Observed);
+    if observed && chain.iter().any(|edge| edge.evidence != EvidenceKind::Observed) { return "Mixed evidence call path"; }
+    match (chain.iter().map(|edge| edge.evidence).max().unwrap_or(EvidenceKind::Source), chain.len() == 1) {
+        (EvidenceKind::Observed, true) => "Observed direct call",
+        (EvidenceKind::Observed, false) => "Observed call path",
+        (EvidenceKind::Loaded, true) => "Loaded-app-assisted call",
+        (EvidenceKind::Loaded, false) => "Loaded-app-assisted call path",
+        (EvidenceKind::Inferred, true) => "Inferred direct call",
+        (EvidenceKind::Inferred, false) => "Inferred call path",
+        (EvidenceKind::Source, true) => "Direct static call",
+        (EvidenceKind::Source, false) => "Indirect static call path",
+    }
+}
+
+fn evidence_filter(mode: usize) -> EvidenceFilter {
+    EvidenceFilter { source: mode <= 2, inferred: mode == 0 || mode == 2, loaded: mode == 0 || mode == 3, observed: mode == 0 || mode == 4 }
+}
+
+fn evidence_title(kind: EvidenceKind) -> &'static str {
+    match kind {
+        EvidenceKind::Source => "Source target",
+        EvidenceKind::Inferred => "Inferred target",
+        EvidenceKind::Loaded => "Loaded-app-assisted target",
+        EvidenceKind::Observed => "Observed target",
     }
 }
 
@@ -1263,7 +1355,7 @@ fn target_description(target: &CallTarget) -> String {
     let definition = &target.definition;
     let location = format!("{} at {}:{}", definition.name, definition.file, definition.line);
     match &target.inference {
-        Some(reason) => format!("Inferred target: {reason} · {location}"),
+        Some(reason) => format!("{}: {reason} · {location}", evidence_title(target.evidence)),
         None => format!("Definition: {location}"),
     }
 }
@@ -1287,7 +1379,7 @@ fn draw_source_line(draw: &mut DrawText, cx: &mut Cx2d, line: &crate::syntax::Hi
             let right = source_text_width(draw, cx.cx, &run.text[..suffix]);
             links.push(CallLink {
                 rect: Rect { pos: dvec2(x + left, pos.y), size: dvec2(right - left, line_height) },
-                target: CallTarget { definition: range.definition.clone(), inference: range.inference.map(str::to_owned) },
+                target: CallTarget { definition: range.definition.clone(), inference: range.inference.map(str::to_owned), evidence: range.evidence },
             });
         }
         draw.draw_abs(cx, dvec2(x, pos.y), run.text);
@@ -1439,20 +1531,30 @@ fn fmt_age(secs: i64) -> String {
 #[cfg(test)]
 mod navigation_tests {
     use super::*;
+    use std::collections::HashSet;
 
     #[test]
     fn inferred_witnesses_and_clicked_targets_name_the_reason_and_location() {
         let source = SymbolRef { name: "A#run".into(), file: "a.rb".into(), line: 2 };
         let definition = SymbolRef { name: "B#run".into(), file: "b.rb".into(), line: 8 };
-        let exact = CallEdge { caller: source, callee: definition.clone(), line: 3, start_column: 0, end_column: 3, inference: None };
+        let exact = CallEdge { caller: source, callee: definition.clone(), line: 3, start_column: 0, end_column: 3, inference: None, evidence: EvidenceKind::Source };
         let mut inferred = exact.clone();
         inferred.inference = Some("Rails belongs_to association".into());
+        inferred.evidence = EvidenceKind::Inferred;
         assert_eq!(witness_label(&[exact.clone()]), "Direct static call");
         assert_eq!(witness_label(&[inferred.clone()]), "Inferred direct call");
         assert_eq!(witness_label(&[exact.clone(), inferred.clone()]), "Inferred call path");
         assert_eq!(witness_label(&[inferred.clone(), exact]), "Inferred call path");
-        let target = CallTarget { definition, inference: inferred.inference };
+        let target = CallTarget { definition, inference: inferred.inference.clone(), evidence: EvidenceKind::Inferred };
         assert_eq!(target_description(&target), "Inferred target: Rails belongs_to association · B#run at b.rb:8");
+        let mut observed = inferred.clone();
+        observed.evidence = EvidenceKind::Observed;
+        observed.inference = Some("request example · 3 calls".into());
+        assert_eq!(witness_label(&[observed.clone()]), "Observed direct call");
+        assert_eq!(witness_label(&[observed.clone(), observed.clone()]), "Observed call path");
+        assert_eq!(witness_label(&[observed.clone(), inferred]), "Mixed evidence call path");
+        let target = CallTarget { definition: observed.callee, inference: observed.inference, evidence: EvidenceKind::Observed };
+        assert!(target_description(&target).starts_with("Observed target: request example"));
     }
 
     #[test]

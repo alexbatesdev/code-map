@@ -27,6 +27,7 @@ pub(super) struct RubyFact {
 pub(super) struct RubyTyped {
     pub value: RubyValue,
     pub reason: Option<String>,
+    pub loaded: bool,
 }
 
 #[derive(Default)]
@@ -38,12 +39,104 @@ pub(super) struct RubyFlow {
     pub helpers: HashSet<String>,
     pub models: HashMap<String, (usize, usize)>,
     pub generated: HashMap<usize, String>,
+    pub loaded_methods: HashMap<(String, bool, String), usize>,
+    pub loaded_symbols: HashSet<usize>,
     declarations: Vec<(String, String, usize, usize, String)>,
     summaries: RefCell<HashMap<(usize, String), Option<RubyTyped>>>,
     active_ivars: RefCell<HashSet<(String, bool, String)>>,
 }
 
 impl Builder<'_> {
+    pub(super) fn ruby_load_snapshot(&mut self) {
+        let Some(snapshot) = self.snapshot else { return };
+        self.ruby_index_evidence_symbols();
+        for class in &snapshot.classes {
+            if !class.file.ends_with(".rb") { continue; }
+            let Some(file) = self.module_paths.get(&class.file).filter(|ids| ids.len() == 1).map(|ids| ids[0]).filter(|&file| self.file_scopes[file].is_some()) else { continue };
+            self.ruby_classes.insert(class.name.clone());
+            self.ruby_constants.insert(class.name.clone());
+            if class.active_record { self.ruby_types.load_model(&class.name); }
+            self.ruby_flow.models.entry(class.name.clone()).or_insert((file, class.line));
+        }
+        for class in &snapshot.classes {
+            let valid_file = class.file.ends_with(".rb") && self.module_paths.get(&class.file).filter(|ids| ids.len() == 1).is_some_and(|ids| self.file_scopes[ids[0]].is_some());
+            if !valid_file || !self.ruby_classes.contains(&class.name) { continue; }
+            for method in &class.methods {
+                let Some(id) = self.ruby_evidence_symbol(&method.definition) else { continue };
+                if self.ruby_source_method(&class.name, method.singleton, &method.name) != Ok(Some(id)) {
+                    self.ruby_flow.loaded_methods.insert((class.name.clone(), method.singleton, method.name.clone()), id);
+                }
+            }
+            if !class.active_record { continue; }
+            for name in &class.attributes {
+                self.ruby_loaded_generated(&class.name, name, &class.file, class.line, format!("Loaded app attribute in {}; target is its supporting declaration ({})", class.name, snapshot.label));
+            }
+            for association in &class.associations {
+                if !self.ruby_classes.contains(&association.target) { continue; }
+                self.ruby_types.load_association(&class.name, &association.name, &association.target, association.collection);
+                self.ruby_loaded_generated(&class.name, &association.name, &class.file, class.line, format!("Loaded app association {}#{} → {} ({})", class.name, association.name, association.target, snapshot.label));
+            }
+        }
+    }
+
+    fn ruby_loaded_generated(&mut self, owner: &str, name: &str, file: &str, line: usize, reason: String) {
+        if self.ruby_method(owner, false, name).ok().flatten().is_some() { return; }
+        let Some(file) = self.module_paths.get(file).filter(|ids| ids.len() == 1).map(|ids| ids[0]) else { return };
+        let (file, line) = self.ruby_flow.declarations.iter().find(|(at, method, ..)| at == owner && method == name)
+            .map(|(_, _, file, line, _)| (*file, *line)).unwrap_or((file, line));
+        self.ruby_generate(owner, false, name, file, line, reason, true);
+        if let Some(ids) = self.ruby_methods.get(&(owner.into(), false, name.into())).filter(|ids| ids.len() == 1) {
+            self.ruby_flow.loaded_symbols.insert(ids[0]);
+        }
+    }
+
+    pub(super) fn ruby_loaded_dispatch_reason(&self, owner: &str, singleton: bool, method: &str, id: usize) -> Option<String> {
+        (self.ruby_flow.loaded_methods.get(&(owner.into(), singleton, method.into())) == Some(&id))
+            .then(|| format!("Loaded app method lookup: {owner}{}{method} resolves to {} ({})", if singleton { "." } else { "#" }, self.graph.symbols[id].name, self.snapshot.map_or("capture", |s| s.label.as_str())))
+    }
+
+    fn ruby_evidence_symbol(&mut self, definition: &SymbolRef) -> Option<usize> {
+        if !definition.file.ends_with(".rb") { return None; }
+        let file = *self.module_paths.get(&definition.file).filter(|ids| ids.len() == 1)?.first()?;
+        if self.file_scopes[file].is_none() { return None; }
+        match self.evidence_symbols.get(definition) {
+            Some(id) => *id,
+            None => {
+                let id = self.symbol(file, definition.name.clone(), definition.line);
+                self.evidence_symbols.insert(definition.clone(), Some(id));
+                Some(id)
+            }
+        }
+    }
+
+    fn ruby_index_evidence_symbols(&mut self) {
+        self.evidence_symbols.clear();
+        for (id, symbol) in self.graph.symbols.iter().enumerate() {
+            self.evidence_symbols.entry(symbol.clone()).and_modify(|value| *value = None).or_insert(Some(id));
+        }
+    }
+
+    pub(super) fn ruby_observed_links(&mut self, links: &mut Vec<(usize, usize, CallSite, Option<String>, EvidenceKind)>) {
+        let Some(snapshot) = self.snapshot else { return };
+        self.ruby_index_evidence_symbols();
+        let mut sites: HashMap<String, HashMap<usize, HashMap<String, Vec<CallSite>>>> = HashMap::new();
+        for call in &snapshot.calls {
+            sites.entry(call.caller.file.clone()).or_default().entry(call.line).or_default().entry(call.method.clone()).or_default();
+        }
+        for call in &self.ruby_calls {
+            if let Some(matching) = sites.get_mut(&self.sources[call.file].path).and_then(|lines| lines.get_mut(&call.site.line)).and_then(|methods| methods.get_mut(&call.method)) {
+                matching.push(call.site);
+            }
+        }
+        for observed in &snapshot.calls {
+            let Some(caller) = self.ruby_evidence_symbol(&observed.caller) else { continue };
+            let Some(callee) = self.ruby_evidence_symbol(&observed.callee) else { continue };
+            let matching = &sites[&observed.caller.file][&observed.line][&observed.method];
+            let site = if matching.len() == 1 { matching[0] } else { CallSite { line: observed.line, start_column: 0, end_column: 0 } };
+            links.push((caller, callee, site, Some(format!("Observed in {}: {} call(s); only exercised execution is covered", snapshot.label, observed.count)), EvidenceKind::Observed));
+        }
+    }
+
     pub(super) fn ruby_expression(&self, node: Node<'_>, file: usize) -> RubyExpr {
         match node.kind() {
             "self" => RubyExpr::SelfValue,
@@ -250,6 +343,7 @@ impl Builder<'_> {
         let id = self.symbol(file, format!("{owner}{}{name}", if singleton { "." } else { "#" }), line);
         self.ruby_methods.insert((owner.into(), singleton, name.into()), vec![id]);
         self.ruby_flow.generated.insert(id, reason);
+        if self.ruby_types.requires_loaded_model(owner) { self.ruby_flow.loaded_symbols.insert(id); }
     }
 
     pub(super) fn ruby_framework_constant(&self, raw: &str, nesting: &[String]) -> Option<String> {
@@ -261,6 +355,11 @@ impl Builder<'_> {
     }
 
     pub(super) fn ruby_method(&self, owner: &str, singleton: bool, method: &str) -> Result<Option<usize>, ()> {
+        if let Some(id) = self.ruby_flow.loaded_methods.get(&(owner.into(), singleton, method.into())) { return Ok(Some(*id)); }
+        self.ruby_source_method(owner, singleton, method)
+    }
+
+    fn ruby_source_method(&self, owner: &str, singleton: bool, method: &str) -> Result<Option<usize>, ()> {
         let mut current = owner;
         let mut seen = HashSet::new();
         loop {
@@ -279,8 +378,9 @@ impl Builder<'_> {
         for fact in facts {
             if !fact.valid { return None; }
             if matches!(fact.expr, RubyExpr::Nil) { continue; }
-            let value = self.ruby_value(&fact.expr, fact.file, &fact.context, seen, depth + 1)?;
+            let mut value = self.ruby_value(&fact.expr, fact.file, &fact.context, seen, depth + 1)?;
             if result.as_ref().is_some_and(|old| old.value != value.value) { return None; }
+            if let Some(old) = &result { value = with_receiver_reason(value, old.reason.as_deref(), old.loaded); }
             result = Some(value);
         }
         result
@@ -289,8 +389,8 @@ impl Builder<'_> {
     pub(super) fn ruby_value(&self, expr: &RubyExpr, file: usize, context: &RubyContext, seen: &mut HashSet<usize>, depth: usize) -> Option<RubyTyped> {
         if depth > 24 { return None; }
         match expr {
-            RubyExpr::Constant(raw) => Some(RubyTyped { value: RubyValue::Class(self.ruby_constant(raw, &context.nesting)?), reason: None }),
-            RubyExpr::SelfValue => Some(RubyTyped { value: if context.singleton { RubyValue::Class(context.class.clone()?) } else { RubyValue::Instance(context.class.clone()?) }, reason: None }),
+            RubyExpr::Constant(raw) => Some(RubyTyped { value: RubyValue::Class(self.ruby_constant(raw, &context.nesting)?), reason: None, loaded: false }),
+            RubyExpr::SelfValue => Some(RubyTyped { value: if context.singleton { RubyValue::Class(context.class.clone()?) } else { RubyValue::Instance(context.class.clone()?) }, reason: None, loaded: false }),
             RubyExpr::Name(name, byte) => {
                 if let Some(scope) = self.ruby_binding_scope(context.scope, name) {
                     if self.ruby_flow.blocked.contains(&(scope, name.clone())) { return None; }
@@ -325,8 +425,9 @@ impl Builder<'_> {
                 let mut result: Option<RubyTyped> = None;
                 for expr in expressions {
                     if matches!(expr, RubyExpr::Nil) { continue; }
-                    let value = self.ruby_value(expr, file, context, seen, depth + 1)?;
+                    let mut value = self.ruby_value(expr, file, context, seen, depth + 1)?;
                     if result.as_ref().is_some_and(|old| old.value != value.value) { return None; }
+                    if let Some(old) = &result { value = with_receiver_reason(value, old.reason.as_deref(), old.loaded); }
                     result = Some(value);
                 }
                 result
@@ -337,42 +438,52 @@ impl Builder<'_> {
 
     fn ruby_send(&self, receiver: &RubyExpr, method: &str, args: RubyArgs, file: usize, context: &RubyContext, seen: &mut HashSet<usize>, depth: usize) -> Option<RubyTyped> {
         let typed = self.ruby_value(receiver, file, context, seen, depth + 1)?;
-        let (owner, singleton) = match &typed.value { RubyValue::Class(owner) | RubyValue::Relation(owner) => (owner, true), RubyValue::Instance(owner) => (owner, false) };
+        let (owner, singleton) = match &typed.value { RubyValue::Class(owner) | RubyValue::Relation(owner) => (owner.clone(), true), RubyValue::Instance(owner) => (owner.clone(), false) };
+        let owner = &owner;
         let found = self.ruby_method(owner, singleton, method).ok()?;
+        let mut typed = typed;
+        if let Some(reason) = found.and_then(|id| self.ruby_loaded_dispatch_reason(owner, singleton, method, id)) {
+            typed = with_receiver_reason(typed, Some(&reason), true);
+        }
         if let Some(id) = found {
             let key = (id, owner.clone());
             let cached = self.ruby_flow.summaries.borrow().get(&key).cloned();
             if let Some(value) = cached {
-                if let Some(value) = value { return Some(with_receiver_reason(value, typed.reason.as_deref())); }
+                if let Some(value) = value { return Some(with_receiver_reason(value, typed.reason.as_deref(), typed.loaded)); }
             } else if seen.insert(id) {
                 let result = self.ruby_flow.returns.get(&id).and_then(|fact| {
                     if fact.context.class.as_deref() != Some(owner) {
                         return ruby_returns_self(&fact.expr).then(|| RubyTyped {
-                            value: if singleton { RubyValue::Class(owner.clone()) } else { RubyValue::Instance(owner.clone()) }, reason: None,
+                            value: if singleton { RubyValue::Class(owner.clone()) } else { RubyValue::Instance(owner.clone()) }, reason: None, loaded: false,
                         });
                     }
                     self.ruby_value(&fact.expr, fact.file, &fact.context, seen, depth + 1)
                 });
                 seen.remove(&id);
                 self.ruby_flow.summaries.borrow_mut().insert(key, result.clone());
-                if let Some(value) = result { return Some(with_receiver_reason(value, typed.reason.as_deref())); }
+                if let Some(value) = result { return Some(with_receiver_reason(value, typed.reason.as_deref(), typed.loaded)); }
             }
         }
         if let Some(value) = self.ruby_types.factory(&typed.value, method, args, found.is_some_and(|id| !self.ruby_flow.generated.contains_key(&id))) {
-            return Some(RubyTyped { value, reason: Some(format!("Rails single-record/query convention: {owner}.{method}")) });
+            let loaded = self.ruby_types.requires_loaded_model(owner);
+            let reason = format!("{}Rails single-record/query convention: {owner}.{method}", if loaded { "Loaded app model ancestry; " } else { "" });
+            return Some(with_receiver_reason(RubyTyped { value, reason: Some(reason), loaded }, typed.reason.as_deref(), typed.loaded));
         }
         if singleton && method == "new" && found.is_none() && !self.ruby_inherited_classes.contains(owner) {
-            return Some(RubyTyped { value: RubyValue::Instance(owner.clone()), reason: Some(format!("Constructed receiver: {owner}.new")) });
+            return Some(with_receiver_reason(RubyTyped { value: RubyValue::Instance(owner.clone()), reason: Some(format!("Constructed receiver: {owner}.new")), loaded: false }, typed.reason.as_deref(), typed.loaded));
         }
         if !singleton {
+            if let Some(value) = self.ruby_types.loaded_association(owner, method).filter(|_| !found.is_some_and(|id| !self.ruby_flow.generated.contains_key(&id))) {
+                return Some(with_receiver_reason(RubyTyped { value, reason: Some(format!("Loaded app association: {owner}#{method}")), loaded: true }, typed.reason.as_deref(), typed.loaded));
+            }
             let mut current = Some(owner.as_str());
             while let Some(at) = current {
                 if self.ruby_methods.get(&(at.into(), false, method.into())).is_some_and(|ids| ids.iter().any(|id| !self.ruby_flow.generated.contains_key(id))) { break; }
                 if let Some(value) = self.ruby_types.association(at, method) {
-                    return Some(RubyTyped { value, reason: Some(format!("Rails association: {at}#{method}")) });
+                    return Some(with_receiver_reason(RubyTyped { value, reason: Some(format!("Rails association: {at}#{method}")), loaded: false }, typed.reason.as_deref(), typed.loaded));
                 }
                 if let Some(ivar) = self.ruby_types.reader(at, method) {
-                    if let Some(value) = self.ruby_ivar(at, false, ivar, seen, depth + 1) { return Some(value); }
+                    if let Some(value) = self.ruby_ivar(at, false, ivar, seen, depth + 1) { return Some(with_receiver_reason(value, typed.reason.as_deref(), typed.loaded)); }
                 }
                 current = self.ruby_types.parent(at);
             }
@@ -381,7 +492,7 @@ impl Builder<'_> {
             let declared = found.is_some() || self.ruby_types.reader(owner, method).is_some();
             if matches!(receiver, RubyExpr::SelfValue) {
                 if found.and_then(|id| self.ruby_flow.returns.get(&id)).is_some_and(|fact| ruby_known_scalar(&fact.expr)) { return None; }
-                return self.ruby_named_hint(method, file, context, declared);
+                return self.ruby_named_hint(method, file, context, declared).map(|value| with_receiver_reason(value, typed.reason.as_deref(), typed.loaded));
             }
         }
         None
@@ -396,7 +507,8 @@ impl Builder<'_> {
         }).collect::<String>();
         let owner = self.ruby_constant(&raw, &context.nesting)?;
         if !self.ruby_types.is_active_record(&owner) { return None; }
-        Some(RubyTyped { value: RubyValue::Instance(owner.clone()), reason: Some(format!("Rails naming convention: `{method}` is treated as {owner}; runtime type is unverified")) })
+        let loaded = self.ruby_types.requires_loaded_model(&owner);
+        Some(RubyTyped { value: RubyValue::Instance(owner.clone()), reason: Some(format!("{}Rails naming convention: `{method}` is treated as {owner}; runtime type is unverified", if loaded { "Loaded app model ancestry; " } else { "" })), loaded })
     }
 }
 
@@ -412,7 +524,8 @@ fn ruby_known_scalar(expr: &RubyExpr) -> bool {
     }
 }
 
-fn with_receiver_reason(mut value: RubyTyped, receiver: Option<&str>) -> RubyTyped {
+fn with_receiver_reason(mut value: RubyTyped, receiver: Option<&str>, loaded: bool) -> RubyTyped {
+    value.loaded |= loaded;
     if let Some(receiver) = receiver {
         value.reason = Some(match value.reason {
             Some(reason) if reason == receiver => reason,
