@@ -1,10 +1,4 @@
-//! megamap: fly over a codebase as a zoomable GPU treemap.
-//!
-//!   cargo run --release -- /path/to/project
-//!   cargo run --release --bin scan -- /path/to/project   (no window, just stats)
-
-pub use makepad_widgets;
-
+//! GPU treemap viewer with a native macOS window.
 mod history;
 mod evidence;
 mod evidence_input;
@@ -13,306 +7,117 @@ mod filter;
 mod relationships;
 mod syntax;
 mod source_cache;
-mod map_view;
 mod model;
 mod scan;
+#[cfg(target_os="macos")] mod platform;
+#[cfg(target_os="macos")] mod canvas;
+#[cfg(target_os="macos")] mod math;
+#[cfg(target_os="macos")] mod map;
+#[cfg(target_os="macos")] mod editor;
+#[cfg(target_os="macos")] mod remote;
+#[cfg(target_os="macos")] mod ui;
 
-use makepad_widgets::*;
-use map_view::{CodeMapAction, CodeMapWidgetRefExt};
-use model::ColorMode;
-use std::path::PathBuf;
+#[cfg(not(target_os="macos"))]
+fn main() { eprintln!("The megamap window currently requires macOS. Use the scan binary for portable analysis."); std::process::exit(1); }
 
-app_main!(App);
+#[cfg(target_os="macos")]
+fn main() {
+    if let Err(error)=run() { eprintln!("megamap: {error}");std::process::exit(1); }
+}
 
-script_mod! {
-    use mod.prelude.widgets.*
-    use mod.widgets.*
-
-    let InfoLabel = Label{
-        width: Fill
-        draw_text +: {color: #xaab4be text_style +: {font_size: 9.0}}
+#[cfg(target_os="macos")]
+fn run()->Result<(),String> {
+    use std::{path::PathBuf,time::{Duration,Instant}};
+    use platform::{Backend,Event,FrameStats};
+    use remote::{Command,Remote};
+    use serde_json::{json,Value};
+    struct CaptureGuard;
+    impl Drop for CaptureGuard { fn drop(&mut self) { evidence_input::cancel_capture(); } }
+    let _guard=CaptureGuard;
+    let mut root=None;
+    let mut evidence=None;
+    let mut remote_port=None;
+    let mut size=(1400.0,900.0);
+    let mut hidden=std::env::var_os("MEGAMAP_HIDE_WINDOWS").is_some();
+    for arg in std::env::args().skip(1) {
+        if arg=="--help" { println!("megamap [project] [--evidence=snapshot.json] [--remote[=port]] [--size=1400x900] [--hidden]");return Ok(()); }
+        else if arg=="--remote" {remote_port=Some(None);}
+        else if arg=="--hidden" {hidden=true;}
+        else if let Some(value)=arg.strip_prefix("--remote=") {remote_port=Some(Some(value.parse::<u16>().map_err(|_|"Invalid remote port")?));}
+        else if let Some(value)=arg.strip_prefix("--evidence=") {evidence=Some(PathBuf::from(value));}
+        else if let Some(value)=arg.strip_prefix("--size=") {
+            let (w,h)=value.split_once('x').ok_or("Use --size=WIDTHxHEIGHT")?;
+            size=(w.parse::<f64>().map_err(|_|"Invalid width")?,h.parse::<f64>().map_err(|_|"Invalid height")?);
+            if !size.0.is_finite()||!size.1.is_finite()||size.0<500.0||size.1<400.0||size.0>8192.0||size.1>8192.0 {return Err("Window size must be between 500x400 and 8192x8192".into());}
+        } else if arg.starts_with('-') {return Err(format!("Unknown option: {arg}"));}
+        else if root.replace(PathBuf::from(arg)).is_some() {return Err("Pass one project directory".into());}
     }
-
-    startup() do #(App::script_component(vm)){
-        ui: Root{
-            main_window := Window{
-                window.title: "megamap"
-                window.app_id: "megamap"
-                window.inner_size: vec2(1400, 900)
-                pass.clear_color: #x07090c
-                window_menu +: {
-                    app_menu +: {name: "megamap"}
-                    about +: {name: "About megamap"}
-                    quit +: {name: "Quit megamap"}
-                    help_about +: {name: "megamap Help"}
+    let root=root.unwrap_or(std::env::current_dir().map_err(|e|e.to_string())?);
+    if !root.is_dir() {return Err("Project directory does not exist".into());}
+    let remote=remote_port.map(Remote::start).transpose()?;
+    if let Some(remote)=&remote {eprintln!("megamap remote: http://{}",remote.address);}
+    let mut backend=Backend::new("megamap",size.0,size.1,hidden)?;
+    backend.set_title(&format!("megamap · {}",root.display()));
+    let mut app=ui::App::new(root,evidence)?;
+    let mut dirty=true;
+    let mut stats=FrameStats::default();
+    let mut frame_count=0u64;
+    let mut app_cpu_ms=0.0;
+    let mut quad_drops=0;
+    let mut last_frame=Instant::now()-Duration::from_secs(1);
+    let mut pending=Vec::new();
+    let capture_dir=std::env::temp_dir().join(format!("spamton-megamap-{}",std::process::id()));
+    while app.running {
+        let active=app.map.needs_frame();
+        let wait=if dirty { (15.0-last_frame.elapsed().as_secs_f64()*1000.0).clamp(0.0,15.0) }else if active {8.0}else{40.0};
+        if let Some(event)=backend.poll(wait) {app.handle(event,&mut backend);dirty=true;}
+        for _ in 0..255 {
+            let Some(event)=backend.poll(0.0) else {break};
+            app.handle(event,&mut backend);dirty=true;
+        }
+        if let Some(remote)=&remote {
+            while let Ok(envelope)=remote.rx.try_recv() {
+                match &envelope.command {
+                    Command::Input(event)=>app.handle(event.clone(),&mut backend),
+                    Command::Click{x,y,button,clicks,modifiers}=>{
+                        app.handle(Event::PointerMove{x:*x,y:*y,modifiers:*modifiers},&mut backend);
+                        app.handle(Event::PointerDown{x:*x,y:*y,button:*button,clicks:*clicks,modifiers:*modifiers},&mut backend);
+                        app.handle(Event::PointerUp{x:*x,y:*y,button:*button,clicks:*clicks,modifiers:*modifiers},&mut backend);
+                    }
+                    _=>{}
                 }
-                body +: {
-                    flow: Down
-                    toolbar := View{
-                        width: Fill height: 40
-                        flow: Right spacing: 14
-                        padding: Inset{left: 12, right: 12}
-                        align: Align{y: 0.5}
-                        show_bg: true
-                        draw_bg +: {color: #x12161c}
-                        title := Label{
-                            width: Fill
-                            text: "megamap"
-                            draw_text +: {color: #xffffff text_style +: {font_size: 10.0}}
-                        }
-                        search := TextInput{
-                            width: 220 height: 28
-                            empty_text: "Search files and folders"
-                        }
-                        color_mode := DropDown{
-                            width: 150
-                            labels: ["File type" "Recently changed" "Most changed"]
-                        }
-                        fit_button := Button{text: "Fit"}
-                        show_ignored := CheckBox{text: "Show ignored" active: #(map_view::DEFAULT_SHOW_IGNORED)}
-                        syntax_colors := CheckBox{text: "Syntax colors" active: #(map_view::DEFAULT_SYNTAX_COLORS)}
-                    }
-                    filters := View{
-                        width: Fill height: 38
-                        flow: Right spacing: 12
-                        padding: Inset{left: 12, right: 12}
-                        align: Align{y: 0.5}
-                        Label{text: "Filter"}
-                        filter_query := TextInput{
-                            width: 420 height: 28
-                            empty_text: "app/ | webpack/ -**/*.spec.ts"
-                        }
-                        hide_tests := CheckBox{text: "Hide specs / tests" active: false}
-                        InfoLabel{width: Fill text: "Spaces: AND   |: OR   -term: exclude   *: wildcard"}
-                    }
-                    relationships := View{
-                        width: Fill height: 38
-                        flow: Right spacing: 12
-                        padding: Inset{left: 12, right: 12}
-                        align: Align{y: 0.5}
-                        relationship_mode := DropDown{
-                            width: 175
-                            labels: ["All files" "Calls from root" "Callers of root"]
-                        }
-                        trace_selected := Button{text: "Trace selected file"}
-                        Label{text: "Call depth"}
-                        relationship_depth := DropDown{
-                            width: 80
-                            labels: ["1" "2" "3" "5" "8"]
-                        }
-                        relationship_root := InfoLabel{width: Fill text: "Select a source file to trace its calls"}
-                        InfoLabel{text: "Call colors match files · Inference reasons in inspector"}
-                    }
-                    evidence := View{
-                        width: Fill height: 38 flow: Right spacing: 8
-                        padding: Inset{left: 12, right: 12}
-                        align: Align{y: 0.5}
-                        evidence_path := TextInput{width: 280 height: 28 empty_text: "Optional evidence snapshot.json"}
-                        evidence_load := Button{text: "Load snapshot"}
-                        evidence_capture := Button{text: "Capture Rails"}
-                        evidence_clear := Button{text: "Static only"}
-                        evidence_mode := DropDown{
-                            width: 175
-                            labels: ["All evidence" "Source only" "Static + inferred" "Loaded app only" "Observed only"]
-                        }
-                        evidence_status := InfoLabel{width: Fill text: "Static analysis; optional app data is off"}
-                    }
-                    View{
-                        width: Fill height: Fill
-                        flow: Right
-                        map := CodeMap{}
-                        inspector := View{
-                            width: 340 height: Fill
-                            flow: Down spacing: 8
-                            padding: Inset{left: 14, right: 14, top: 14, bottom: 14}
-                            show_bg: true
-                            draw_bg +: {color: #x12161c}
-                            Label{
-                                text: "INSPECTOR"
-                                draw_text +: {color: #x5a6570 text_style +: {font_size: 8.0}}
-                            }
-                            info_title := Label{
-                                width: Fill
-                                text: "Click something on the map"
-                                draw_text +: {color: #xffffff text_style +: {font_size: 11.0}}
-                            }
-                            info_path := InfoLabel{text: ""}
-                            ScrollYView{
-                                width: Fill height: Fill
-                                info_details := InfoLabel{text: ""}
-                            }
-                            InfoLabel{
-                                text: "Scroll: zoom\nDrag: pan\nClick: inspect\nColored call: jump to target\nInferred targets: see inspector reasons\nDouble click: fly to it\nEnter in search: next match\nStriped boxes are ignored by git.\nClick one to read it."
-                            }
-                        }
-                    }
-                    View{
-                        width: Fill height: 26
-                        flow: Right
-                        padding: Inset{right: 12}
-                        status := Label{
-                            width: Fill height: Fill
-                            text: ""
-                            padding: Inset{left: 12, right: 12, top: 6}
-                            draw_text +: {color: #x8a949e text_style +: {font_size: 9.0}}
-                        }
-                        loading_indicator := LoadingSpinner{
-                            width: 28 height: 26
-                            visible: false
-                            draw_bg +: {
-                                pixel: fn() {
-                                    let sdf = Sdf2d.viewport(self.pos * vec2(32.0, 28.0))
-                                    let pulse = 0.65 + 0.35 * sin(self.draw_pass.time * 4.18879)
-                                    let gold = vec4(1.0, 0.78, 0.22, pulse)
-                                    sdf.move_to(16.0, 1.0)
-                                    sdf.line_to(23.0, 13.0)
-                                    sdf.line_to(9.0, 13.0)
-                                    sdf.close_path()
-                                    sdf.fill(gold)
-                                    sdf.move_to(8.0, 14.0)
-                                    sdf.line_to(15.0, 26.0)
-                                    sdf.line_to(1.0, 26.0)
-                                    sdf.close_path()
-                                    sdf.fill(gold)
-                                    sdf.move_to(24.0, 14.0)
-                                    sdf.line_to(31.0, 26.0)
-                                    sdf.line_to(17.0, 26.0)
-                                    sdf.close_path()
-                                    return sdf.fill(gold)
-                                }
-                            }
-                        }
-                    }
-                }
+                pending.push(envelope);dirty=true;
             }
         }
-    }
-}
-
-#[derive(Script, ScriptHook)]
-pub struct App {
-    #[live]
-    ui: WidgetRef,
-}
-
-/// The folder to map: first command line argument, or the current folder.
-fn project_path() -> PathBuf {
-    let arg = std::env::args().skip(1).find(|a| !a.starts_with("--"));
-    let path = arg.map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
-    path.canonicalize().unwrap_or(path)
-}
-
-impl MatchEvent for App {
-    fn handle_startup(&mut self, cx: &mut Cx) {
-        let path = project_path();
-        self.ui.label(cx, ids!(title)).set_text(cx, &format!("megamap: {}", path.display()));
-        let map = self.ui.code_map(cx, ids!(map));
-        map.open(cx, path);
-        if let Some(path) = std::env::args().find_map(|arg| arg.strip_prefix("--evidence=").map(PathBuf::from)) {
-            self.ui.text_input(cx, ids!(evidence_path)).set_text(cx, &path.to_string_lossy());
-            map.set_evidence_input(cx, evidence_input::EvidenceInput::File(path));
+        dirty|=app.tick();
+        if app.map.loading()&&last_frame.elapsed()>=Duration::from_millis(16) {dirty=true;}
+        if dirty&&(last_frame.elapsed()>=Duration::from_millis(15)||!pending.is_empty()) {
+            let start=Instant::now();
+            backend.begin_frame([0.035,0.045,0.055,1.0]);
+            quad_drops=app.draw(&mut backend);
+            stats=backend.present()?;
+            app_cpu_ms=start.elapsed().as_secs_f64()*1000.0;
+            if stats.skipped==0 {dirty=false;frame_count+=1;last_frame=Instant::now();}
         }
-    }
-
-    fn handle_actions(&mut self, cx: &mut Cx, actions: &Actions) {
-        let map = self.ui.code_map(cx, ids!(map));
-        if self.ui.button(cx, ids!(evidence_load)).clicked(actions) {
-            let path = self.ui.text_input(cx, ids!(evidence_path)).text();
-            map.set_evidence_input(cx, evidence_input::EvidenceInput::File(PathBuf::from(path)));
-        }
-        if self.ui.button(cx, ids!(evidence_capture)).clicked(actions) {
-            map.set_evidence_input(cx, evidence_input::EvidenceInput::Rails);
-        }
-        if self.ui.button(cx, ids!(evidence_clear)).clicked(actions) {
-            map.set_evidence_input(cx, evidence_input::EvidenceInput::Static);
-        }
-        if let Some(mode) = self.ui.drop_down(cx, ids!(evidence_mode)).changed(actions) {
-            map.set_evidence_mode(cx, mode);
-        }
-        if self.ui.button(cx, ids!(fit_button)).clicked(actions) {
-            map.fit(cx);
-        }
-        if let Some(show) = self.ui.check_box(cx, ids!(show_ignored)).changed(actions) {
-            map.set_show_ignored(cx, show);
-        }
-        if let Some(query) = self.ui.text_input(cx, ids!(filter_query)).changed(actions) {
-            map.set_filter(cx, &query);
-        }
-        if let Some(hide) = self.ui.check_box(cx, ids!(hide_tests)).changed(actions) {
-            map.set_hide_tests(cx, hide);
-        }
-        if let Some(on) = self.ui.check_box(cx, ids!(syntax_colors)).changed(actions) {
-            map.set_syntax_colors(cx, on);
-        }
-        if let Some(mode) = self.ui.drop_down(cx, ids!(relationship_mode)).changed(actions) {
-            map.set_relationship_mode(cx, mode);
-        }
-        if let Some(depth) = self.ui.drop_down(cx, ids!(relationship_depth)).changed(actions) {
-            map.set_relationship_depth(cx, [1, 2, 3, 5, 8][depth.min(4)]);
-        }
-        if self.ui.button(cx, ids!(trace_selected)).clicked(actions) {
-            map.trace_selected(cx);
-        }
-        if let Some(index) = self.ui.drop_down(cx, ids!(color_mode)).changed(actions) {
-            let mode = match index {
-                1 => ColorMode::Recent,
-                2 => ColorMode::Churn,
-                _ => ColorMode::FileType,
+        if dirty {continue;}
+        for envelope in pending.drain(..) {
+            let reply:Value=match envelope.command {
+                Command::Help=>json!({"app":"megamap","routes":["/s","/snap","/stats","/click","/m","/k","/t","/g","/gq","/quit"]}),
+                Command::Snapshot{query,all}=>app.snapshot(query.as_deref(),all),
+                Command::State=>app.state(),
+                Command::Stats=>json!({"frames":frame_count,"app_cpu_ms":app_cpu_ms,"submit_cpu_ms":stats.cpu_ms,"gpu_ms":stats.gpu_ms,"instances":stats.instances,"draw_calls":stats.draw_calls,"blits":stats.blits,"atlas_glyphs":stats.atlas_glyphs,"atlas_used_bytes":stats.atlas_used_bytes,"atlas_capacity_bytes":platform::ATLAS_CAPACITY_BYTES,"atlas_upload_bytes":stats.atlas_upload_bytes,"dropped_instances":stats.dropped_instances,"dropped_glyphs":stats.dropped_glyphs,"dropped_quads":quad_drops,"skipped":stats.skipped}),
+                Command::Grab{quit}=>{
+                    std::fs::create_dir_all(&capture_dir).map_err(|e|e.to_string())?;
+                    let path=capture_dir.join(format!("frame-{frame_count}.png"));
+                    let result=match backend.capture(&path) {Ok(())=>json!({"png":[path]}),Err(error)=>json!({"error":error})};
+                    if quit {app.running=false;}
+                    result
+                }
+                Command::Quit=>{app.running=false;json!({"ok":true})}
+                _=>json!({"ok":true}),
             };
-            map.set_color_mode(cx, mode);
-        }
-        let search = self.ui.text_input(cx, ids!(search));
-        if let Some(query) = search.changed(actions) {
-            map.set_search(cx, &query);
-        }
-        if search.returned(actions).is_some() {
-            map.next_match(cx);
-        }
-        if search.escaped(actions) {
-            search.set_text(cx, "");
-            map.set_search(cx, "");
-        }
-        // A widget can emit several actions in one batch, so look at all of them.
-        let uid = map.widget_uid();
-        for action in actions {
-            let Some(wa) = action.as_widget_action() else { continue };
-            if wa.widget_uid != uid {
-                continue;
-            }
-            match wa.cast::<CodeMapAction>() {
-                CodeMapAction::Status(text) => self.ui.label(cx, ids!(status)).set_text(cx, &text),
-                CodeMapAction::EvidenceStatus(text) => self.ui.label(cx, ids!(evidence_status)).set_text(cx, &text),
-                CodeMapAction::Root(text, mode) => {
-                    self.ui.label(cx, ids!(relationship_root)).set_text(cx, &text);
-                    self.ui.drop_down(cx, ids!(relationship_mode)).set_selected_item(cx, mode);
-                }
-                CodeMapAction::Selected(info) => {
-                    self.ui.label(cx, ids!(info_title)).set_text(cx, &info.title);
-                    self.ui.label(cx, ids!(info_path)).set_text(cx, &info.path);
-                    self.ui.label(cx, ids!(info_details)).set_text(cx, &info.details);
-                }
-                CodeMapAction::None => {}
-            }
+            let _=envelope.reply.send(reply);
         }
     }
-}
-
-impl AppMain for App {
-    fn script_mod(vm: &mut ScriptVm) -> ScriptValue {
-        crate::makepad_widgets::script_mod(vm);
-        crate::map_view::script_mod(vm);
-        self::script_mod(vm)
-    }
-
-    fn handle_event(&mut self, cx: &mut Cx, event: &Event) {
-        if matches!(event, Event::Shutdown | Event::WindowClosed(_)) { evidence_input::cancel_capture(); }
-        self.match_event(cx, event);
-        self.ui.handle_event(cx, event, &mut Scope::empty());
-        let loading = self.ui.code_map(cx, ids!(map)).is_loading();
-        let indicator = self.ui.view(cx, ids!(loading_indicator));
-        indicator.set_visible(cx, loading);
-        if loading && matches!(event, Event::NextFrame(_)) {
-            indicator.redraw(cx);
-        }
-    }
+    Ok(())
 }

@@ -5,7 +5,6 @@ edition = "2021"
 default-run = "megamap"
 
 [dependencies]
-makepad-widgets = { path = "../makepad/widgets" }
 tree-sitter = "0.25.10"
 tree-sitter-highlight = "0.25.10"
 tree-sitter-ruby = "0.23.1"
@@ -13,12 +12,4 @@ tree-sitter-javascript = "0.25.0"
 tree-sitter-typescript = "0.23.2"
 serde_json = "1"
 
-# Makepad replaces a few crates.io crates with its own copies. Its workspace
-# does this in its root Cargo.toml, so we repeat it here for our own crate.
-[patch.crates-io]
-bitflags = { path = "../makepad/libs/bitflags" }
-smallvec = { path = "../makepad/libs/smallvec" }
-windows-link = { path = "../makepad/libs/windows/windows-link" }
-
-# An empty workspace table: this crate is its own project, not part of Makepad's.
 [workspace]

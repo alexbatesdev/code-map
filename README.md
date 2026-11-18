@@ -130,28 +130,25 @@ Fly over a codebase as a zoomable GPU treemap. Based on
 
 ## Setup
 
-You need Rust (https://rustup.rs) and a Makepad checkout **next to** this repo, because
-`Cargo.toml` points at `../makepad`:
+The viewer requires macOS 11 or newer, Rust and Apple's command-line developer
+tools (`xcrun clang`). Clone this repository alone; no sibling checkout or
+bundled font/resource directory is required. The build uses the installed Apple
+SDK and compiles the Metal shaders at runtime. No additional graphics crates
+are downloaded.
 
 ```sh
-mkdir megamap && cd megamap
-git clone https://github.com/makepad/makepad.git
-git -C makepad checkout a4ea2536a4ab223fb31e0282be923191230f44fe   # dev branch, 2026-09-15
-git clone --branch alex/runtime-evidence https://github.com/alexbatesdev/code-map.git
+git clone --branch alex/native-metal https://github.com/alexbatesdev/code-map.git
+cd code-map
+cargo build --release --bins --locked
 ```
-
-Makepad's API moves fast, so stick to the pinned commit above. Newer commits may or may not
-build.
 
 ## Run
 
 ```sh
-cd code-map
 cargo run --release -- /path/to/some/project
 ```
 
-The first build compiles Makepad and takes a few minutes. Later builds are fast. Without a path
-it maps the current folder. It works best on a git repository: the ignore rules then match
+Without a path it maps the current folder. It works best on a git repository: the ignore rules then match
 `git status` exactly and the heatmap has history to show. Outside git it falls back to a simple
 ignore list.
 
@@ -162,6 +159,9 @@ cargo run --release --bin scan -- /path/to/some/project [ignored/path ...]
 ```
 
 ## Controls
+
+Hover over a toolbar control for a short explanation. Help appears after half a
+second and closes when you leave the control or interact with the app.
 
 | Input | Action |
 | --- | --- |
@@ -176,11 +176,25 @@ cargo run --release --bin scan -- /path/to/some/project [ignored/path ...]
 
 | File | What it does |
 | --- | --- |
-| `src/main.rs` | App shell: window, toolbar and inspector written in Makepad's Splash DSL |
+| `src/main.rs`, `src/ui.rs` | Event loop, custom toolbar controls and inspector |
 | `src/scan.rs` | Reads the project from disk, asks git which files are ignored, summarizes every line |
 | `src/model.rs` | Treemap layout and colors |
 | `src/history.rs` | Reads `git log` for the heatmap modes |
-| `src/map_view.rs` | The custom `CodeMap` widget: drawing, zoom, picking, search |
+| `src/map.rs`, `src/canvas.rs` | Map controller, drawing, zoom, picking and search |
+| `native/megamap.m`, `src/platform.rs` | AppKit window/input, Metal batches and CoreText glyph atlas |
+| `src/editor.rs` | Text selection, editing and composition |
 
-Tested on macOS. Makepad also targets Windows, Linux and web, but this app has not been tried
-there.
+The window currently supports macOS only. The `scan` binary and analysis modules
+remain portable; no Windows, Linux or web UI is provided.
+
+Text is shaped with system fonts and drawn from a bounded GPU glyph atlas.
+Rectangles and glyphs share a batched Metal instance stream. Frames render on
+changes, animation and loading; the idle viewer does not continuously redraw.
+For local verification, `--remote[=port]` enables a loopback-only input/state/PNG
+endpoint; it is off by default. `--hidden` renders to an owned Metal target
+without showing a window. `/stats` reports frame CPU/GPU timings and capacity
+drops. Captures contain source text from the mapped repository.
+
+Native input regressions (macOS, no window) run with
+`./tools/test_native_input.sh`. Run the optional loopback lifecycle/large-response
+check explicitly with `cargo test --release --bin megamap -- --ignored`.
