@@ -1,8 +1,8 @@
 [package]
-name = "code-map"
+name = "megamap"
 version = "0.1.0"
 edition = "2021"
-default-run = "code-map"
+default-run = "megamap"
 
 [dependencies]
 makepad-widgets = { path = "../makepad/widgets" }

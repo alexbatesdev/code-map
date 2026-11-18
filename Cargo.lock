@@ -74,19 +74,6 @@ name = "cfg_aliases"
 version = "0.2.1"
 
 [[package]]
-name = "code-map"
-version = "0.1.0"
-dependencies = [
- "makepad-widgets",
- "serde_json",
- "tree-sitter",
- "tree-sitter-highlight",
- "tree-sitter-javascript",
- "tree-sitter-ruby",
- "tree-sitter-typescript",
-]
-
-[[package]]
 name = "convert_case"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -588,6 +575,19 @@ name = "makepad-zune-qoi"
 version = "0.5.2"
 dependencies = [
  "makepad-zune-core",
+]
+
+[[package]]
+name = "megamap"
+version = "0.1.0"
+dependencies = [
+ "makepad-widgets",
+ "serde_json",
+ "tree-sitter",
+ "tree-sitter-highlight",
+ "tree-sitter-javascript",
+ "tree-sitter-ruby",
+ "tree-sitter-typescript",
 ]
 
 [[package]]

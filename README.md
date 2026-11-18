@@ -1,4 +1,4 @@
-# Code Map
+# megamap
 
 ## Explorer fork
 
@@ -30,7 +30,7 @@ original map. The viewer uses a zoomable 2D treemap.
   call sites are in the caller files; select one to see its calls into the root.
   Optional Ruby, JS/JSX and TS/TSX syntax colors use Tree-sitter. Parsing runs on a background worker and is
   cached. Unsupported languages and files above 2 MiB retain
-  plain text. The code map's existing column clipping still applies.
+  plain text. The map's existing column clipping still applies.
 - **Loading:** a gold Triforce pulses in the bottom-right corner while background
   scans, history, call indexing, folder expansion or source loading are pending.
   It disappears when all pending work finishes.
@@ -54,9 +54,8 @@ from non-ignored supported source files in the original scan.
 The original setup instructions below still apply. Build and test the fork with
 `cargo build --release --bins --locked` and `cargo test --release --locked`.
 
-Fly over a codebase as a zoomable GPU treemap. A small demo app built with
-[Makepad](https://github.com/makepad/makepad), a Rust UI framework that renders everything on
-the GPU. Inspired by Rik Arends' "Makepad Scope" demo.
+Fly over a codebase as a zoomable GPU treemap. Based on
+[Code Map](https://github.com/Peeter95/code-map).
 
 - Every file is a box sized by its line count, grouped by folder. Zoom in far enough and the
   actual code appears inside the box.
@@ -71,7 +70,7 @@ You need Rust (https://rustup.rs) and a Makepad checkout **next to** this repo, 
 `Cargo.toml` points at `../makepad`:
 
 ```sh
-mkdir makepad-demo && cd makepad-demo
+mkdir megamap && cd megamap
 git clone https://github.com/makepad/makepad.git
 git -C makepad checkout a4ea2536a4ab223fb31e0282be923191230f44fe   # dev branch, 2026-09-15
 git clone --branch alex/code-explorer https://github.com/alexbatesdev/code-map.git

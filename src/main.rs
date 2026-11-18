@@ -1,4 +1,4 @@
-//! Code Map: fly over a codebase as a zoomable GPU treemap.
+//! megamap: fly over a codebase as a zoomable GPU treemap.
 //!
 //!   cargo run --release -- /path/to/project
 //!   cargo run --release --bin scan -- /path/to/project   (no window, just stats)
@@ -33,8 +33,16 @@ script_mod! {
     startup() do #(App::script_component(vm)){
         ui: Root{
             main_window := Window{
+                window.title: "megamap"
+                window.app_id: "megamap"
                 window.inner_size: vec2(1400, 900)
                 pass.clear_color: #x07090c
+                window_menu +: {
+                    app_menu +: {name: "megamap"}
+                    about +: {name: "About megamap"}
+                    quit +: {name: "Quit megamap"}
+                    help_about +: {name: "megamap Help"}
+                }
                 body +: {
                     flow: Down
                     toolbar := View{
@@ -46,7 +54,7 @@ script_mod! {
                         draw_bg +: {color: #x12161c}
                         title := Label{
                             width: Fill
-                            text: "Code Map"
+                            text: "megamap"
                             draw_text +: {color: #xffffff text_style +: {font_size: 10.0}}
                         }
                         search := TextInput{
@@ -180,7 +188,7 @@ fn project_path() -> PathBuf {
 impl MatchEvent for App {
     fn handle_startup(&mut self, cx: &mut Cx) {
         let path = project_path();
-        self.ui.label(cx, ids!(title)).set_text(cx, &format!("Code Map: {}", path.display()));
+        self.ui.label(cx, ids!(title)).set_text(cx, &format!("megamap: {}", path.display()));
         let map = self.ui.code_map(cx, ids!(map));
         map.open(cx, path);
     }
