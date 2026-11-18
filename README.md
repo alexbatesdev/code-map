@@ -26,6 +26,13 @@ original map. The viewer uses a zoomable 2D treemap.
   to fly to the resolved declaration. Its line is highlighted and the inspector
   shows the method and line number. The trace root, filters and depth stay put.
   Only resolved colored calls are links; dynamic or ambiguous calls remain plain.
+- **Ruby receivers:** follows single source assignments and aliases, simple
+  method returns, readers and compatible instance-variable assignments. Rails
+  model inheritance enables finder/query and association inference, including
+  labeled `current_company`-style helpers. The inspector shows inference reasons
+  for calls, paths and clicked targets; the status counts inferred call sites.
+  Generated Rails targets jump to the model, macro or schema annotation that
+  supports the inference, rather than claiming a source method body exists.
 - **Source colors:** the trace view highlights exact resolved method-call names
   at readable zoom. The inspector lists their source lines and columns. Incoming
   call sites are in the caller files; select one to see its calls into the root.
@@ -40,11 +47,14 @@ Call paths traverse method/function symbols before grouping them into files.
 If A calls `B.run`, and only the unrelated `B.other` calls C, A does not acquire
 an indirect connection to C. Imports supply bindings; they are not call edges.
 
-This is conservative **static analysis**, not a recording of runtime execution.
-Only supported, unambiguous source bindings become edges. Dynamic Ruby dispatch,
-Rails callbacks/autoload behavior, reflection, framework scheduling, nested
-qualified Ruby class declarations, HTTP/GraphQL
-boundaries and arbitrary receiver types are not reconstructed. A missing edge
+This is **static analysis**, not a recording of runtime execution. Source-bound
+calls and labeled receiver/framework inferences become edges. Rails inferences
+can be wrong when runtime behavior differs from the supported conventions.
+Ambiguous writes, conflicting types and unsupported association contracts stay
+unresolved. Dynamic Ruby dispatch, Rails callbacks/autoload behavior, reflection,
+framework scheduling, custom inflections, interprocedural argument types, nested
+qualified Ruby class declarations, HTTP/GraphQL boundaries and arbitrary receiver
+types are not reconstructed. A missing edge
 does not prove that code cannot execute. The status bar reports unresolved sites
 and files rejected for parse errors. TypeScript relative imports and an explicit
 `compilerOptions.baseUrl` in `tsconfig.json` are supported; custom path aliases
@@ -74,7 +84,7 @@ You need Rust (https://rustup.rs) and a Makepad checkout **next to** this repo, 
 mkdir megamap && cd megamap
 git clone https://github.com/makepad/makepad.git
 git -C makepad checkout a4ea2536a4ab223fb31e0282be923191230f44fe   # dev branch, 2026-09-15
-git clone --branch alex/code-explorer https://github.com/alexbatesdev/code-map.git
+git clone --branch alex/ruby-receiver-inference https://github.com/alexbatesdev/code-map.git
 ```
 
 Makepad's API moves fast, so stick to the pinned commit above. Newer commits may or may not

@@ -7,7 +7,7 @@
 use crate::history::{self, History};
 use crate::call_colors::{self, CallHighlights, CallMark};
 use crate::filter::Filter;
-use crate::relationships::{supports_path, Direction, Graph, Reachability, SourceFile, SymbolRef};
+use crate::relationships::{supports_path, CallEdge, Direction, Graph, Reachability, SourceFile, SymbolRef};
 use crate::syntax::HighlightedText;
 use crate::model::{code_inner, frame, ColorMode, Kind, Tree, CHAR_W, COL_CHARS, R};
 use crate::scan::{self, Entry};
@@ -135,7 +135,13 @@ struct Label {
 
 struct CallLink {
     rect: Rect,
-    target: SymbolRef,
+    target: CallTarget,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CallTarget {
+    definition: SymbolRef,
+    inference: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -200,7 +206,7 @@ pub struct CodeMap {
     #[rust]
     selected: Option<usize>,
     #[rust]
-    definition_focus: Option<SymbolRef>,
+    definition_focus: Option<CallTarget>,
     #[rust]
     call_links: Vec<CallLink>,
     #[rust]
@@ -457,7 +463,7 @@ impl CodeMap {
                 }
             }
         }
-        if self.definition_focus.as_ref().is_some_and(|focus| self.tree.find(&focus.file).is_none_or(|i| !self.tree.is_visible(i))) {
+        if self.definition_focus.as_ref().is_some_and(|focus| self.tree.find(&focus.definition.file).is_none_or(|i| !self.tree.is_visible(i))) {
             self.definition_focus = None;
         }
         if let Some(index) = self.selected.filter(|&i| self.tree.is_visible(i)) {
@@ -537,23 +543,24 @@ impl CodeMap {
         node.code_line_rect(line)
     }
 
-    fn jump_to_definition(&mut self, cx: &mut Cx, target: SymbolRef) {
+    fn jump_to_definition(&mut self, cx: &mut Cx, target: CallTarget) {
         self.source_anchor = None;
-        let Some(index) = self.tree.find(&target.file) else { return };
-        let Some(line) = self.definition_line_rect(index, target.line) else { return };
+        let definition = &target.definition;
+        let Some(index) = self.tree.find(&definition.file) else { return };
+        let Some(line) = self.definition_line_rect(index, definition.line) else { return };
         self.flight = None;
-        let source = self.tree.nodes[index].lines[target.line - 1];
+        let source = self.tree.nodes[index].lines[definition.line - 1];
         self.flight = Some(definition_camera(line, source.indent as usize, source.len as usize, self.view.size));
         self.frame = cx.new_next_frame();
         self.definition_focus = Some(target.clone());
         self.selected = Some(index);
         self.ensure_text(cx, index);
         cx.widget_action(self.uid, CodeMapAction::Selected(self.info(index)));
-        self.set_status(cx, format!("{} · Definition: {} at {}:{}", self.summary(), target.name, target.file, target.line));
+        self.set_status(cx, format!("{} · {}", self.summary(), target_description(&target)));
         self.redraw(cx);
     }
 
-    fn call_at(&self, abs: DVec2) -> Option<SymbolRef> {
+    fn call_at(&self, abs: DVec2) -> Option<CallTarget> {
         if !self.view.contains(abs) || self.label_rects.iter().any(|r| r.contains(abs)) { return None; }
         self.call_links.iter().find(|link| link.rect.contains(abs)).map(|link| link.target.clone())
     }
@@ -586,9 +593,9 @@ impl CodeMap {
         if self.relationship_mode > 0 {
             if let Some(reachable) = &self.reachable {
                 let visible = |path: &&String| self.tree.find(path).is_some_and(|index| self.tree.is_visible(index));
-                text.push_str(&format!(" · {} direct / {} indirect files · depth {}: {} reached methods / {} cross-file call sites",
+                text.push_str(&format!(" · {} direct / {} indirect files · depth {}: {} reached methods / {} cross-file call sites ({} inferred)",
                     reachable.direct.iter().filter(visible).count(), reachable.indirect.iter().filter(visible).count(), self.relationship_depth,
-                    reachable.reached_symbols, self.call_highlights.site_count()));
+                    reachable.reached_symbols, self.call_highlights.site_count(), self.call_highlights.inferred_site_count()));
             }
             if let Some(graph) = &self.graph {
                 text.push_str(&format!(" · {} unresolved sites / {} parse errors / {} unread files",
@@ -784,27 +791,34 @@ impl CodeMap {
             if self.relationship_root.as_deref() == Some(n.path.as_str()) {
                 details.push_str("\n\nCall root: all methods in this file.\nDepth counts method-call hops;\ndeeper methods can stay in the\nsame files.");
             } else if let Some(chain) = self.reachable.as_ref().and_then(|r| r.witnesses.get(&n.path)) {
-                details.push_str(if chain.len() == 1 { "\n\nDirect static call" } else { "\n\nIndirect static call path" });
+                details.push_str("\n\n");
+                details.push_str(witness_label(chain));
                 for edge in chain {
                     details.push_str(&format!("\n\n{}\n{}:{}\n  calls {}\n{}:{}",
                         short_label(&edge.caller.name, 40), short_label(&edge.caller.file, 42), edge.line,
                         short_label(&edge.callee.name, 38), short_label(&edge.callee.file, 42), edge.callee.line));
+                    if let Some(reason) = &edge.inference {
+                        details.push_str(&format!("\nInferred target: {reason}"));
+                    }
                 }
-                details.push_str("\n\nStatic resolution; execution depends\non runtime inputs and dispatch.");
+                details.push_str("\n\nStatic analysis; execution depends\non runtime inputs and dispatch.\nInferred targets are candidates.");
             }
             let connections = self.call_highlights.connections(&n.path);
             if !connections.is_empty() {
                 details.push_str("\n\nColored calls in this file:");
                 for (line, mark) in connections.iter().take(16) {
                     details.push_str(&format!("\nL{}:{} → {}", line, mark.start + 1, short_label(&mark.target, 31)));
+                    if let Some(reason) = &mark.inference {
+                        details.push_str(&format!("\nInferred target: {reason}"));
+                    }
                 }
                 if connections.len() > 16 { details.push_str(&format!("\n…and {} more call sites", connections.len() - 16)); }
             } else if self.relationship_mode == 2 {
                 details.push_str("\n\nIncoming call sites are in the\ncaller files. Select one to see\nits colored calls to this file.");
             }
         }
-        if let Some(target) = self.definition_focus.as_ref().filter(|target| target.file == n.path) {
-            details.push_str(&format!("\n\nDefinition: {}\nLine {} (highlighted)", target.name, target.line));
+        if let Some(target) = self.definition_focus.as_ref().filter(|target| target.definition.file == n.path) {
+            details.push_str(&format!("\n\n{}\nLine {} (highlighted)", target_description(target), target.definition.line));
         }
         NodeInfo {
             title: n.name.clone(),
@@ -955,7 +969,7 @@ impl CodeMap {
                 let source_rect = node.code_line_rect(k + 1).unwrap();
                 let line_rect = self.to_screen(source_rect);
                 let (x, y) = (line_rect.pos.x, line_rect.pos.y);
-                if self.definition_focus.as_ref().is_some_and(|target| target.file == node.path && target.line == k + 1) {
+                if self.definition_focus.as_ref().is_some_and(|target| target.definition.file == node.path && target.definition.line == k + 1) {
                     block(&mut self.draw_block, cx, line_rect, vec4(0.95, 0.73, 0.24, 0.12), vec4(0.95, 0.73, 0.24, 0.9), 1.5, 0.0);
                 }
                 if text_mode {
@@ -1236,6 +1250,24 @@ fn short_label(text: &str, max: usize) -> String {
     else { text.chars().take(max.saturating_sub(1)).chain(['…']).collect() }
 }
 
+fn witness_label(chain: &[CallEdge]) -> &'static str {
+    match (chain.iter().any(|edge| edge.inference.is_some()), chain.len() == 1) {
+        (true, true) => "Inferred direct call",
+        (true, false) => "Inferred call path",
+        (false, true) => "Direct static call",
+        (false, false) => "Indirect static call path",
+    }
+}
+
+fn target_description(target: &CallTarget) -> String {
+    let definition = &target.definition;
+    let location = format!("{} at {}:{}", definition.name, definition.file, definition.line);
+    match &target.inference {
+        Some(reason) => format!("Inferred target: {reason} · {location}"),
+        None => format!("Definition: {location}"),
+    }
+}
+
 fn draw_source_line(draw: &mut DrawText, cx: &mut Cx2d, line: &crate::syntax::HighlightedLine, marks: &[CallMark], root: Option<&str>, syntax: bool, pos: DVec2, line_height: f64, fade: f32) -> Vec<CallLink> {
     let ranges = call_colors::link_ranges(marks, line.text.chars().count().min(COL_CHARS as usize));
     let mut links = Vec::new();
@@ -1255,7 +1287,7 @@ fn draw_source_line(draw: &mut DrawText, cx: &mut Cx2d, line: &crate::syntax::Hi
             let right = source_text_width(draw, cx.cx, &run.text[..suffix]);
             links.push(CallLink {
                 rect: Rect { pos: dvec2(x + left, pos.y), size: dvec2(right - left, line_height) },
-                target: range.definition.clone(),
+                target: CallTarget { definition: range.definition.clone(), inference: range.inference.map(str::to_owned) },
             });
         }
         draw.draw_abs(cx, dvec2(x, pos.y), run.text);
@@ -1407,6 +1439,21 @@ fn fmt_age(secs: i64) -> String {
 #[cfg(test)]
 mod navigation_tests {
     use super::*;
+
+    #[test]
+    fn inferred_witnesses_and_clicked_targets_name_the_reason_and_location() {
+        let source = SymbolRef { name: "A#run".into(), file: "a.rb".into(), line: 2 };
+        let definition = SymbolRef { name: "B#run".into(), file: "b.rb".into(), line: 8 };
+        let exact = CallEdge { caller: source, callee: definition.clone(), line: 3, start_column: 0, end_column: 3, inference: None };
+        let mut inferred = exact.clone();
+        inferred.inference = Some("Rails belongs_to association".into());
+        assert_eq!(witness_label(&[exact.clone()]), "Direct static call");
+        assert_eq!(witness_label(&[inferred.clone()]), "Inferred direct call");
+        assert_eq!(witness_label(&[exact.clone(), inferred.clone()]), "Inferred call path");
+        assert_eq!(witness_label(&[inferred.clone(), exact]), "Inferred call path");
+        let target = CallTarget { definition, inference: inferred.inference };
+        assert_eq!(target_description(&target), "Inferred target: Rails belongs_to association · B#run at b.rb:8");
+    }
 
     #[test]
     fn source_position_and_readable_zoom_survive_a_trace_layout_change() {

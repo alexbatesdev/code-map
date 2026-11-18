@@ -3,6 +3,11 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use tree_sitter::{Node, Parser};
 
+mod ruby_types;
+mod ruby_flow;
+use ruby_types::{AssociationKind, RubyArgs, RubyTypes, RubyValue};
+use ruby_flow::{RubyExpr, RubyFact, RubyFlow};
+
 pub const MAX_DEPTH: usize = 8;
 
 pub fn supports_path(path: &str) -> bool {
@@ -41,6 +46,7 @@ pub struct CallEdge {
     /// Zero-based rendered Unicode scalar columns; end is exclusive and each tab occupies four.
     pub start_column: usize,
     pub end_column: usize,
+    pub inference: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -222,6 +228,7 @@ enum RubyReceiver {
     SelfValue,
     Constant(String),
     Instance(String),
+    Value(RubyExpr),
     Unknown,
 }
 
@@ -255,6 +262,8 @@ struct Builder<'a> {
     ruby_inherited_classes: HashSet<String>,
     ruby_methods: HashMap<(String, bool, String), Vec<usize>>,
     ruby_top_methods: HashMap<(usize, String), Vec<usize>>,
+    ruby_types: RubyTypes,
+    ruby_flow: RubyFlow,
 }
 
 impl<'a> Builder<'a> {
@@ -270,6 +279,7 @@ impl<'a> Builder<'a> {
             js_calls: Vec::new(), assignments: Vec::new(), member_assignments: Vec::new(),
             ruby_calls: Vec::new(), ruby_classes: HashSet::new(), ruby_constants: HashSet::new(), ruby_assigned_constants: HashSet::new(), ruby_qualified_assignments: Vec::new(), ruby_inherited_classes: HashSet::new(), ruby_methods: HashMap::new(),
             ruby_top_methods: HashMap::new(),
+            ruby_types: RubyTypes::default(), ruby_flow: RubyFlow::default(),
         }
     }
 
@@ -718,6 +728,12 @@ impl<'a> Builder<'a> {
                 self.ruby_classes.insert(qualified.clone());
                 self.ruby_constants.insert(qualified.clone());
                 if node.child_by_field_name("superclass").is_some() { self.ruby_inherited_classes.insert(qualified.clone()); }
+                let parent = node.child_by_field_name("superclass").and_then(|n| named(n).first().copied());
+                let parent = parent.map(|n| self.text(file, n).to_owned());
+                self.ruby_types.record_class(&qualified, parent.as_deref(), &context.nesting);
+                if parent.is_some() {
+                    self.ruby_flow.models.entry(qualified.clone()).or_insert((file, node.start_position().row + 1));
+                }
                 let scope = self.scope(None, true);
                 let body_symbol = self.symbol(file, format!("{qualified}.<body>"), node.start_position().row + 1);
                 let mut inner = context.clone();
@@ -769,11 +785,17 @@ impl<'a> Builder<'a> {
                 inner.definitions_singleton = false;
                 if let Some(parameters) = node.child_by_field_name("parameters") {
                     self.ruby_parameters(parameters, file, &inner);
+                    self.ruby_block_parameters(inner.scope);
                 }
-                if let Some(body) = node.child_by_field_name("body") { self.ruby(body, file, &inner); }
+                if let Some(body) = node.child_by_field_name("body") {
+                    let expr = self.ruby_return_expression(body, file);
+                    self.ruby_flow.returns.insert(id, RubyFact { expr, context: inner.clone(), file, byte: body.start_byte(), valid: true });
+                    self.ruby(body, file, &inner);
+                }
                 return;
             }
             "call" => {
+                self.ruby_declaration(node, file, context);
                 if let Some(method) = node.child_by_field_name("method") {
                     let receiver = node.child_by_field_name("receiver").map(|n| self.ruby_receiver(n, file)).unwrap_or(RubyReceiver::Implicit);
                     self.ruby_calls.push(RubyCall { file, context: context.clone(), receiver, method: self.text(file, method).into(), bare: false, site: self.call_site(file, method) });
@@ -788,6 +810,7 @@ impl<'a> Builder<'a> {
                 return;
             }
             "assignment" | "operator_assignment" => {
+                self.ruby_value_assignment(node, file, context);
                 if let Some(left) = node.child_by_field_name("left") {
                     self.ruby_assignment(left, file, context);
                     self.pattern(left, file, context.scope);
@@ -795,11 +818,22 @@ impl<'a> Builder<'a> {
                 if let Some(right) = node.child_by_field_name("right") { self.ruby(right, file, context); }
                 return;
             }
+            "for" => {
+                if let Some(pattern) = node.child_by_field_name("pattern") {
+                    self.ruby_record_loop_binding(pattern, file, context);
+                    self.pattern(pattern, file, context.scope);
+                }
+                for field in ["value", "body"] {
+                    if let Some(child) = node.child_by_field_name(field) { self.ruby(child, file, context); }
+                }
+                return;
+            }
             "block" | "do_block" | "lambda" => {
                 let mut inner = context.clone();
                 inner.caller = self.symbol(file, format!("<block@{}>", node.start_position().row + 1), node.start_position().row + 1);
                 inner.scope = self.scope(Some(context.scope), true);
                 if let Some(parameters) = node.child_by_field_name("parameters") { self.pattern(parameters, file, inner.scope); }
+                self.ruby_block_parameters(inner.scope);
                 if let Some(body) = node.child_by_field_name("body") { self.ruby(body, file, &inner); }
                 return;
             }
@@ -830,8 +864,9 @@ impl<'a> Builder<'a> {
                         return RubyReceiver::Instance(self.text(file, receiver).into());
                     }
                 }
-                RubyReceiver::Unknown
+                RubyReceiver::Value(self.ruby_expression(node, file))
             }
+            "identifier" | "instance_variable" | "parenthesized_statements" => RubyReceiver::Value(self.ruby_expression(node, file)),
             _ => RubyReceiver::Unknown,
         }
     }
@@ -870,28 +905,48 @@ impl<'a> Builder<'a> {
         }
     }
 
-    fn ruby_target(&self, call: &RubyCall) -> Option<usize> {
+    fn ruby_target(&self, call: &RubyCall) -> Option<(usize, Option<String>)> {
         let implicit = matches!(call.receiver, RubyReceiver::Implicit | RubyReceiver::SelfValue);
         if call.bare && self.ruby_local(call.context.scope, &call.method) { return None; }
-        let (owner, singleton) = match &call.receiver {
-            RubyReceiver::Implicit | RubyReceiver::SelfValue => (call.context.class.clone(), call.context.singleton),
-            RubyReceiver::Constant(raw) => (self.ruby_constant(raw, &call.context.nesting), true),
+        let (owner, singleton, inference) = match &call.receiver {
+            RubyReceiver::Implicit | RubyReceiver::SelfValue => (call.context.class.clone(), call.context.singleton, None),
+            RubyReceiver::Constant(raw) => (self.ruby_constant(raw, &call.context.nesting), true, None),
             RubyReceiver::Instance(raw) => {
                 let owner = self.ruby_constant(raw, &call.context.nesting)?;
-                if self.ruby_inherited_classes.contains(&owner) || self.ruby_methods.contains_key(&(owner.clone(), true, "new".into())) { return None; }
-                (Some(owner), false)
+                if self.ruby_method(&owner, true, "new").ok()?.is_some_and(|id| !self.ruby_flow.generated.contains_key(&id)) { return None; }
+                if self.ruby_inherited_classes.contains(&owner) && !self.ruby_types.is_active_record(&owner) { return None; }
+                let inference = self.ruby_types.is_active_record(&owner).then(|| format!("Rails constructed receiver: {owner}.new"));
+                (Some(owner), false, inference)
+            }
+            RubyReceiver::Value(expr) => {
+                let typed = self.ruby_value(expr, call.file, &call.context, &mut HashSet::new(), 0)?;
+                let (owner, singleton) = match typed.value {
+                    RubyValue::Class(owner) => (owner, true),
+                    RubyValue::Instance(owner) => (owner, false),
+                    RubyValue::Relation(_) => return None,
+                };
+                (Some(owner), singleton, typed.reason)
             }
             RubyReceiver::Unknown => return None,
         };
         if let Some(owner) = owner {
-            let (singleton, method) = if singleton && call.method == "new" && !self.ruby_methods.contains_key(&(owner.clone(), true, "new".into())) {
-                if self.ruby_inherited_classes.contains(&owner) { return None; }
+            let (singleton, method) = if singleton && call.method == "new" && self.ruby_method(&owner, true, "new").ok()?.is_none() {
+                if self.ruby_inherited_classes.contains(&owner) && !self.ruby_types.is_active_record(&owner) { return None; }
                 (false, "initialize")
             } else { (singleton, call.method.as_str()) };
-            return self.ruby_methods.get(&(owner, singleton, method.into())).filter(|ids| ids.len() == 1).map(|ids| ids[0]);
+            return self.ruby_method(&owner, singleton, method).ok().flatten().map(|id| {
+                let generated = self.ruby_flow.generated.get(&id);
+                let reason = match (inference, generated) {
+                    (Some(a), Some(b)) => Some(format!("{a}; {b}")),
+                    (Some(a), None) => Some(a),
+                    (None, Some(b)) => Some(b.clone()),
+                    _ => None,
+                };
+                (id, reason)
+            });
         }
         if implicit && call.context.class.is_none() {
-            return self.ruby_top_methods.get(&(call.file, call.method.clone())).filter(|ids| ids.len() == 1).map(|ids| ids[0]);
+            return self.ruby_top_methods.get(&(call.file, call.method.clone())).filter(|ids| ids.len() == 1).map(|ids| (ids[0], None));
         }
         None
     }
@@ -914,6 +969,10 @@ impl<'a> Builder<'a> {
                 self.ruby_assigned_constants.insert(qualified);
             }
         }
+        let mut types = std::mem::take(&mut self.ruby_types);
+        types.resolve(|raw, nesting| self.ruby_framework_constant(raw, nesting));
+        self.ruby_types = types;
+        self.ruby_generated_methods();
         for (mut scope, name) in self.assignments.clone() {
             loop {
                 if let Some(value) = self.scopes[scope].bindings.get_mut(&name) { *value = Binding::Unknown; break; }
@@ -937,21 +996,21 @@ impl<'a> Builder<'a> {
             let target = if call.constructor {
                 match target { Binding::Class(class) => self.js_method(class, false, "constructor"), _ => None }
             } else { match target { Binding::Callable(id) => Some(id), _ => None } };
-            if let Some(target) = target { links.push((call.caller, target, call.site)); }
+            if let Some(target) = target { links.push((call.caller, target, call.site, None)); }
             else { self.graph.unresolved_sites += 1; }
         }
         for call in &self.ruby_calls {
-            if let Some(target) = self.ruby_target(call) { links.push((call.context.caller, target, call.site)); }
+            if let Some((target, inference)) = self.ruby_target(call) { links.push((call.context.caller, target, call.site, inference)); }
             else if !call.bare || !self.ruby_local(call.context.scope, &call.method) { self.graph.unresolved_sites += 1; }
         }
         self.graph.outgoing = vec![Vec::new(); self.graph.symbols.len()];
         self.graph.incoming = vec![Vec::new(); self.graph.symbols.len()];
         let mut unique = HashSet::new();
-        for (caller, callee, site) in links {
+        for (caller, callee, site, inference) in links {
             let CallSite { line, start_column, end_column } = site;
             if !unique.insert((caller, callee, line, start_column, end_column)) { continue; }
             let id = self.graph.edges.len();
-            self.graph.edges.push(CallEdge { caller: self.graph.symbols[caller].clone(), callee: self.graph.symbols[callee].clone(), line, start_column, end_column });
+            self.graph.edges.push(CallEdge { caller: self.graph.symbols[caller].clone(), callee: self.graph.symbols[callee].clone(), line, start_column, end_column, inference });
             self.graph.endpoints.push((caller, callee));
             self.graph.outgoing[caller].push(id);
             self.graph.incoming[callee].push(id);
@@ -1219,6 +1278,250 @@ mod tests {
         assert!(graph.related("a.rb", Direction::Callees, 2).indirect.contains("c.rb"));
         let duplicate = super::tests::graph(&[("a.rb", "class A\n def self.a; B.b; end\nend"), ("b.rb", "class B\n def self.b; end\nend"), ("other.rb", "class B\n def self.b; end\nend")]);
         assert_eq!(duplicate.edges.len(), 0);
+    }
+
+    #[test]
+    fn ruby_assigned_records_and_aliases_call_the_model_instance_method() {
+        let graph = graph(&[
+            ("application_record.rb", "class ApplicationRecord < ActiveRecord::Base; end"),
+            ("company.rb", "class Company < ApplicationRecord\n def run; Target.finish; end\nend"),
+            ("worker.rb", "class Worker\n def perform(id)\n compy = Company.find(id)\n another_name = compy\n another_name.run\n end\nend"),
+            ("target.rb", "class Target\n def self.finish; end\nend"),
+        ]);
+        assert_eq!(graph.parse_errors, 0);
+        let incoming = graph.related("company.rb", Direction::Callers, 1);
+        assert!(incoming.direct.contains("worker.rb"));
+        let call = graph.edges.iter().find(|e| e.caller.file == "worker.rb" && e.callee.name == "Company#run").unwrap();
+        assert_eq!((call.line, call.start_column, call.end_column), (5, 14, 17));
+        assert_eq!(call.callee.name, "Company#run");
+        assert!(graph.related("worker.rb", Direction::Callees, 2).indirect.contains("target.rb"));
+    }
+
+    #[test]
+    fn ruby_locals_keep_constructed_instance_and_source_factory_types() {
+        let graph = graph(&[
+            ("company.rb", "class Company\n def run; end\nend"),
+            ("factory.rb", "class Factory\n def self.build; Company.new; end\nend"),
+            ("worker.rb", "class Worker\n def perform\n compy = Factory.build\n compy.run\n end\nend"),
+        ]);
+        assert_eq!(graph.parse_errors, 0);
+        assert!(graph.related("company.rb", Direction::Callers, 1).direct.contains("worker.rb"));
+    }
+
+    #[test]
+    fn ruby_rails_helpers_are_labeled_and_lexical_shadowing_wins() {
+        let graph = graph(&[
+            ("application_record.rb", "class ApplicationRecord < ActiveRecord::Base; end"),
+            ("company.rb", "class Company < ApplicationRecord; def run; end; end"),
+            ("base.rb", "class ApplicationController\n def current_company; request_company; end\n helper_method :current_company\nend"),
+            ("controller.rb", "class Controller < ApplicationController\n def show; current_company.run; end\n def shadow(current_company); current_company.run; end\n def local; current_company = unknown; current_company.run; end\nend"),
+        ]);
+        assert_eq!(graph.parse_errors, 0);
+        let calls: Vec<_> = graph.edges.iter().filter(|e| e.callee.name == "Company#run").collect();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].line, 2);
+        assert!(calls[0].inference.as_deref().unwrap().contains("Rails naming convention"));
+    }
+
+    #[test]
+    fn ruby_instance_facts_follow_readers_associations_and_query_results() {
+        let graph = graph(&[
+            ("application_record.rb", "class ApplicationRecord < ActiveRecord::Base; end"),
+            ("company.rb", "class Company < ApplicationRecord; def run; end; end"),
+            ("person.rb", "class Person < ApplicationRecord; belongs_to :company; end"),
+            ("worker.rb", "class Worker\n attr_reader :company\n def initialize; @company = Company.find_by(id: 1); end\n def perform; company.run; Person.find(1).company.run; Company.where(active: true).first.run; end\nend"),
+        ]);
+        assert_eq!(graph.parse_errors, 0);
+        let calls: Vec<_> = graph.edges.iter().filter(|e| e.callee.name == "Company#run").collect();
+        assert_eq!(calls.len(), 3);
+        assert!(calls.iter().all(|e| e.inference.is_some()));
+    }
+
+    #[test]
+    fn ruby_reassignments_conditional_writes_and_block_captures_do_not_keep_types() {
+        for body in [
+            "compy = Company.find(1); compy = unknown; compy.run",
+            "if maybe; compy = Company.find(1); end; compy.run",
+            "compy = Company.find(1); items.each { compy = unknown }; compy.run",
+            "compy = Company.find(1); items.each { |compy| compy.run }",
+            "compy = Company.find(1); for compy in items; compy.run; end",
+            "compy.run; compy = Company.find(1)",
+        ] {
+            let graph = graph(&[
+                ("application_record.rb", "class ApplicationRecord < ActiveRecord::Base; end"),
+                ("company.rb", "class Company < ApplicationRecord; def run; end; end"),
+                ("worker.rb", &format!("class Worker; def perform; {body}; end; end")),
+            ]);
+            assert_eq!(graph.parse_errors, 0, "{body}");
+            assert!(!graph.edges.iter().any(|e| e.callee.name == "Company#run"), "{body}");
+        }
+    }
+
+    #[test]
+    fn ruby_collection_finders_and_custom_overrides_do_not_become_company_instances() {
+        for expression in ["Company.find([1, 2])", "Company.find(1, 2)", "Company.first(2)", "Company.where(active: true)"] {
+            let graph = graph(&[
+                ("application_record.rb", "class ApplicationRecord < ActiveRecord::Base; end"),
+                ("company.rb", "class Company < ApplicationRecord; def run; end; end"),
+                ("worker.rb", &format!("class Worker; def perform; compy = {expression}; compy.run; end; end")),
+            ]);
+            assert!(!graph.edges.iter().any(|e| e.callee.name == "Company#run"), "{expression}");
+        }
+        let graph = graph(&[
+            ("application_record.rb", "class ApplicationRecord < ActiveRecord::Base; end"),
+            ("company.rb", "class Company < ApplicationRecord; def self.find(id); Other.new; end; def run; end; end"),
+            ("other.rb", "class Other; def run; end; end"),
+            ("worker.rb", "class Worker; def perform; compy = Company.find(1); compy.run; end; end"),
+        ]);
+        assert!(!graph.edges.iter().any(|e| e.callee.name == "Company#run"));
+        assert!(graph.edges.iter().any(|e| e.callee.name == "Other#run"));
+    }
+
+    #[test]
+    fn ruby_generated_model_methods_link_to_declarations_with_inference_labels() {
+        let graph = graph(&[
+            ("application_record.rb", "class ApplicationRecord < ActiveRecord::Base; end"),
+            ("company.rb", "# == Schema Information\n#  name :string\nclass Company < ApplicationRecord\n has_many :people\nend"),
+            ("person.rb", "class Person < ApplicationRecord; end"),
+            ("controller.rb", "class Controller; def current_company; unknown; end; def show; current_company.id; current_company.people; Company.find(1); end; end"),
+        ]);
+        assert_eq!(graph.parse_errors, 0);
+        for name in ["Company#id", "Company#people", "Company.find"] {
+            let edge = graph.edges.iter().find(|e| e.callee.name == name).unwrap();
+            assert_eq!(edge.callee.file, "company.rb");
+            assert!(edge.inference.as_deref().unwrap().contains("Rails"));
+        }
+        assert_eq!(graph.edges.iter().find(|e| e.callee.name == "Company#people").unwrap().callee.line, 4);
+    }
+
+    #[test]
+    fn ruby_schema_annotations_supply_labeled_attribute_targets_at_the_annotation() {
+        let graph = graph(&[
+            ("application_record.rb", "class ApplicationRecord < ActiveRecord::Base; end"),
+            ("company.rb", "# == Schema Information\n#  name   :string(191)  not null\nclass Company < ApplicationRecord\nend"),
+            ("worker.rb", "class Worker; def perform; Company.find(1).name; end; end"),
+        ]);
+        assert_eq!(graph.parse_errors, 0);
+        let edge = graph.edges.iter().find(|e| e.callee.name == "Company#name").unwrap();
+        assert_eq!(edge.callee.file, "company.rb");
+        assert_eq!(edge.callee.line, 2);
+        assert!(edge.inference.as_deref().unwrap().contains("schema annotation"));
+    }
+
+    #[test]
+    fn ruby_generated_model_targets_use_the_inheritance_declaration_in_either_file_order() {
+        for reverse in [false, true] {
+            let mut sources = vec![
+                ("application_record.rb", "class ApplicationRecord < ActiveRecord::Base; end"),
+                ("app/controllers/company/messages_controller.rb", "class Company; class MessagesController; end; end"),
+                ("app/models/company.rb", "# == Schema Information\n#  name :string\nclass Company < ApplicationRecord; end"),
+                ("worker.rb", "class Worker; def perform; compy = Company.find(1); compy.id; compy.name; end; end"),
+            ];
+            if reverse { sources.reverse(); }
+            let graph = graph(&sources);
+            assert_eq!(graph.parse_errors, 0);
+            for name in ["Company.find", "Company#id", "Company#name"] {
+                let edge = graph.edges.iter().find(|e| e.caller.file == "worker.rb" && e.callee.name == name).unwrap();
+                assert_eq!(edge.callee.file, "app/models/company.rb", "{reverse}: {name}");
+                assert_eq!(edge.callee.line, if name == "Company#name" { 2 } else { 3 });
+                assert!(edge.inference.is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn ruby_helper_literals_and_conflicting_instance_writes_reject_name_hints() {
+        for body in ["def current_company; 42; end; def show; current_company.run; end", "def show; @current_company = Company.new; @current_company = Other.new; @current_company.run; end"] {
+            let graph = graph(&[
+                ("application_record.rb", "class ApplicationRecord < ActiveRecord::Base; end"),
+                ("company.rb", "class Company < ApplicationRecord; def run; end; end"),
+                ("other.rb", "class Other; def run; end; end"),
+                ("controller.rb", &format!("class Controller; {body}; end")),
+            ]);
+            assert!(!graph.edges.iter().any(|e| e.callee.name == "Company#run"), "{body}");
+        }
+    }
+
+    #[test]
+    fn ruby_source_return_summaries_keep_receiver_inference_on_every_use() {
+        let graph = graph(&[
+            ("application_record.rb", "class ApplicationRecord < ActiveRecord::Base; end"),
+            ("company.rb", "class Company < ApplicationRecord; def same; self; end; def run; end; end"),
+            ("worker.rb", "class Worker; def perform; Company.find(1).same.run; Company.find(2).same.run; end; end"),
+        ]);
+        let calls: Vec<_> = graph.edges.iter().filter(|e| e.caller.file == "worker.rb" && e.callee.name == "Company#run").collect();
+        assert_eq!(calls.len(), 2);
+        assert!(calls.iter().all(|e| e.inference.as_deref().is_some_and(|reason| reason.contains("Rails"))));
+    }
+
+    #[test]
+    fn ruby_inherited_factory_attempts_do_not_poison_the_base_factory_cache() {
+        let graph = graph(&[
+            ("company.rb", "class Company; def run; end; end"),
+            ("factory.rb", "class Factory; def self.build; Company.new; end; end\nclass Derived < Factory; end"),
+            ("worker.rb", "class Worker; def perform; Derived.build.run; Factory.build.run; end; end"),
+        ]);
+        assert!(graph.edges.iter().any(|e| e.caller.file == "worker.rb" && e.callee.name == "Company#run"));
+    }
+
+    #[test]
+    fn ruby_inherited_self_factories_dispatch_to_each_receiver_in_either_order() {
+        for calls in ["Factory.build.run; Child.build.run", "Child.build.run; Factory.build.run"] {
+            let graph = graph(&[
+                ("factory.rb", "class Factory; def self.build; self; end; def self.run; end; end"),
+                ("child.rb", "class Child < Factory; def self.run; end; end"),
+                ("worker.rb", &format!("class Worker; def perform; {calls}; end; end")),
+            ]);
+            assert_eq!(graph.parse_errors, 0);
+            let mut targets: Vec<_> = graph.edges.iter().filter(|e| e.caller.file == "worker.rb" && e.callee.name.ends_with(".run")).map(|e| e.callee.name.as_str()).collect();
+            targets.sort_unstable();
+            assert_eq!(targets, ["Child.run", "Factory.run"], "{calls}");
+        }
+    }
+
+    #[test]
+    fn ruby_association_options_support_both_symbol_key_forms_and_reject_unknown_contracts() {
+        for options in ["class_name: 'Other'", ":class_name => 'Other'", "{ :class_name => 'Other' }", ":\"class_name\" => 'Other'", ":'class_name' => 'Other'"] {
+            let graph = graph(&[
+                ("application_record.rb", "class ApplicationRecord < ActiveRecord::Base; end"),
+                ("company.rb", "class Company < ApplicationRecord; def run; end; end"),
+                ("other.rb", "class Other < ApplicationRecord; def run; end; end"),
+                ("person.rb", &format!("class Person < ApplicationRecord; belongs_to :company, {options}; end")),
+                ("worker.rb", "class Worker; def perform; Person.find(1).company.run; end; end"),
+            ]);
+            assert_eq!(graph.parse_errors, 0, "{options}");
+            let calls: Vec<_> = graph.edges.iter().filter(|e| e.caller.file == "worker.rb" && e.callee.name.ends_with("#run")).collect();
+            assert_eq!(calls.len(), 1, "{options}");
+            assert_eq!(calls[0].callee.name, "Other#run", "{options}");
+            assert!(calls[0].inference.is_some());
+        }
+        for options in ["polymorphic: true", ":polymorphic => true", ":\"polymorphic\" => true", "option_key => 'Other'", ":\"#{option_key}\" => 'Other'", "**options", "class_name: model_name"] {
+            let graph = graph(&[
+                ("application_record.rb", "class ApplicationRecord < ActiveRecord::Base; end"),
+                ("company.rb", "class Company < ApplicationRecord; def run; end; end"),
+                ("person.rb", &format!("class Person < ApplicationRecord; belongs_to :company, {options}; end")),
+                ("worker.rb", "class Worker; def perform; Person.find(1).company.run; end; end"),
+            ]);
+            assert_eq!(graph.parse_errors, 0, "{options}");
+            assert!(!graph.edges.iter().any(|e| e.callee.name == "Company#run"), "{options}");
+        }
+    }
+
+    #[test]
+    fn ruby_descendant_readers_override_ancestor_methods_and_link_to_the_macro() {
+        let graph = graph(&[
+            ("application_record.rb", "class ApplicationRecord < ActiveRecord::Base; end"),
+            ("company.rb", "class Company < ApplicationRecord; def run; end; end"),
+            ("other.rb", "class Other; def run; end; end"),
+            ("parent.rb", "class Parent; def company; Other.new; end; end"),
+            ("child.rb", "class Child < Parent\n attr_reader :company\n def initialize; @company = Company.find(1); end\n def perform; company.run; end\nend"),
+        ]);
+        assert_eq!(graph.parse_errors, 0);
+        assert!(!graph.edges.iter().any(|e| e.caller.name == "Child#perform" && matches!(e.callee.name.as_str(), "Parent#company" | "Other#run")));
+        let reader = graph.edges.iter().find(|e| e.caller.name == "Child#perform" && e.callee.name == "Child#company").unwrap();
+        assert_eq!(reader.callee.line, 2);
+        assert!(reader.inference.as_deref().unwrap().contains("attr_reader"));
+        assert!(graph.edges.iter().any(|e| e.caller.name == "Child#perform" && e.callee.name == "Company#run"));
     }
 
     #[test]

@@ -98,7 +98,7 @@ script_mod! {
                             labels: ["1" "2" "3" "5" "8"]
                         }
                         relationship_root := InfoLabel{width: Fill text: "Select a source file to trace its calls"}
-                        InfoLabel{text: "Call colors match files · Click a call to jump"}
+                        InfoLabel{text: "Call colors match files · Inference reasons in inspector"}
                     }
                     View{
                         width: Fill height: Fill
@@ -125,7 +125,7 @@ script_mod! {
                                 info_details := InfoLabel{text: ""}
                             }
                             InfoLabel{
-                                text: "Scroll: zoom\nDrag: pan\nClick: inspect\nColored call: jump to definition\nDouble click: fly to it\nEnter in search: next match\nStriped boxes are ignored by git.\nClick one to read it."
+                                text: "Scroll: zoom\nDrag: pan\nClick: inspect\nColored call: jump to target\nInferred targets: see inspector reasons\nDouble click: fly to it\nEnter in search: next match\nStriped boxes are ignored by git.\nClick one to read it."
                             }
                         }
                     }

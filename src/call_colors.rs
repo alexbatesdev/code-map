@@ -9,6 +9,7 @@ pub struct CallMark {
     pub end: usize,
     pub target: String,
     pub definition: SymbolRef,
+    pub inference: Option<String>,
 }
 
 #[derive(Default)]
@@ -24,12 +25,13 @@ impl CallHighlights {
                 || !visible.contains(&edge.caller.file) || !visible.contains(&edge.callee.file) { continue; }
             result.files.entry(edge.caller.file.clone()).or_default().entry(edge.line).or_default().push(CallMark {
                 start: edge.start_column, end: edge.end_column, target: edge.callee.file.clone(), definition: edge.callee.clone(),
+                inference: edge.inference.clone(),
             });
         }
         for lines in result.files.values_mut() {
             for marks in lines.values_mut() {
-                marks.sort_by(|a, b| (a.start, a.end, &a.target, &a.definition.name, &a.definition.file, a.definition.line)
-                    .cmp(&(b.start, b.end, &b.target, &b.definition.name, &b.definition.file, b.definition.line)));
+                marks.sort_by(|a, b| (a.start, a.end, &a.target, &a.definition.name, &a.definition.file, a.definition.line, &a.inference)
+                    .cmp(&(b.start, b.end, &b.target, &b.definition.name, &b.definition.file, b.definition.line, &b.inference)));
                 marks.dedup();
             }
         }
@@ -44,6 +46,10 @@ impl CallHighlights {
         self.files.values().flat_map(|lines| lines.values()).map(Vec::len).sum()
     }
 
+    pub fn inferred_site_count(&self) -> usize {
+        self.files.values().flat_map(|lines| lines.values()).flatten().filter(|mark| mark.inference.is_some()).count()
+    }
+
     pub fn connections(&self, file: &str) -> Vec<(usize, &CallMark)> {
         self.files.get(file).into_iter().flat_map(|lines| lines.iter())
             .flat_map(|(&line, marks)| marks.iter().map(move |mark| (line, mark))).collect()
@@ -55,6 +61,7 @@ pub struct LinkRange<'a> {
     pub start: usize,
     pub end: usize,
     pub definition: &'a SymbolRef,
+    pub inference: Option<&'a str>,
 }
 
 fn marked_columns(marks: &[CallMark], columns: usize) -> (Vec<Option<&CallMark>>, Vec<bool>) {
@@ -64,6 +71,9 @@ fn marked_columns(marks: &[CallMark], columns: usize) -> (Vec<Option<&CallMark>>
         for column in mark.start.min(columns)..mark.end.min(columns) {
             if result[column].is_some_and(|previous| previous.definition != mark.definition) {
                 ambiguous[column] = true;
+            }
+            if result[column].is_some_and(|previous| previous.definition == mark.definition && previous.inference.is_some() && mark.inference.is_none()) {
+                continue;
             }
             result[column] = Some(mark);
         }
@@ -81,10 +91,10 @@ pub fn link_ranges(marks: &[CallMark], columns: usize) -> Vec<LinkRange<'_>> {
     let mut result: Vec<LinkRange<'_>> = Vec::new();
     for (column, mark) in marked.into_iter().enumerate() {
         let Some(mark) = mark else { continue };
-        if let Some(previous) = result.last_mut().filter(|previous| previous.end == column && *previous.definition == mark.definition) {
+        if let Some(previous) = result.last_mut().filter(|previous| previous.end == column && *previous.definition == mark.definition && previous.inference == mark.inference.as_deref()) {
             previous.end = column + 1;
         } else {
-            result.push(LinkRange { start: column, end: column + 1, definition: &mark.definition });
+            result.push(LinkRange { start: column, end: column + 1, definition: &mark.definition, inference: mark.inference.as_deref() });
         }
     }
     result
@@ -158,7 +168,7 @@ mod tests {
     use crate::syntax::HighlightedText;
 
     fn mark(start: usize, end: usize, file: &str, name: &str, line: usize) -> CallMark {
-        CallMark { start, end, target: file.into(), definition: SymbolRef { name: name.into(), file: file.into(), line } }
+        CallMark { start, end, target: file.into(), definition: SymbolRef { name: name.into(), file: file.into(), line }, inference: None }
     }
 
     #[test]
@@ -186,7 +196,7 @@ mod tests {
     #[test]
     fn hidden_targets_and_same_file_calls_have_no_color_marks() {
         let symbol = |file: &str| SymbolRef { name: "run".into(), file: file.into(), line: 1 };
-        let edge = |target: &str| CallEdge { caller: symbol("a.ts"), callee: symbol(target), line: 1, start_column: 0, end_column: 3 };
+        let edge = |target: &str| CallEdge { caller: symbol("a.ts"), callee: symbol(target), line: 1, start_column: 0, end_column: 3, inference: None };
         let visible = HashSet::from(["a.ts".into(), "b.ts".into()]);
         let marks = CallHighlights::new(&[edge("b.ts"), edge("b.ts"), edge("hidden.ts"), edge("a.ts")], &visible);
         assert_eq!(marks.site_count(), 1);
@@ -217,13 +227,13 @@ mod tests {
         let caller = SymbolRef { name: "caller".into(), file: "a.ts".into(), line: 1 };
         let first = mark(0, 3, "b.ts", "run", 4);
         let second = mark(0, 3, "b.ts", "run", 8);
-        let edge = |mark: &CallMark| CallEdge { caller: caller.clone(), callee: mark.definition.clone(), line: 2, start_column: mark.start, end_column: mark.end };
+        let edge = |mark: &CallMark| CallEdge { caller: caller.clone(), callee: mark.definition.clone(), line: 2, start_column: mark.start, end_column: mark.end, inference: mark.inference.clone() };
         let visible = HashSet::from(["a.ts".into(), "b.ts".into()]);
         let highlights = CallHighlights::new(&[edge(&first), edge(&second), edge(&first)], &visible);
         assert_eq!(highlights.site_count(), 2);
         assert!(link_ranges(highlights.line("a.ts", 2), 3).is_empty());
         let marks = [first.clone(), first];
-        assert_eq!(link_ranges(&marks, 3), vec![LinkRange { start: 0, end: 3, definition: &marks[0].definition }]);
+        assert_eq!(link_ranges(&marks, 3), vec![LinkRange { start: 0, end: 3, definition: &marks[0].definition, inference: None }]);
     }
 
     #[test]
@@ -231,10 +241,43 @@ mod tests {
         let text = HighlightedText::new("a.rb", "\té = B.run");
         let marks = [mark(10, 13, "b.rb", "run", 4), mark(11, 12, "b.rb", "other", 8), mark(2, 2, "b.rb", "empty", 1), mark(8, 3, "b.rb", "backward", 1)];
         let ranges = link_ranges(&marks, 12);
-        assert_eq!(ranges, vec![LinkRange { start: 10, end: 11, definition: &marks[0].definition }]);
+        assert_eq!(ranges, vec![LinkRange { start: 10, end: 11, definition: &marks[0].definition, inference: None }]);
         assert_eq!(text.lines[0].text.chars().skip(ranges[0].start).take(ranges[0].end - ranges[0].start).collect::<String>(), "r");
         assert!(link_ranges(&marks, 10).is_empty());
         assert!(link_ranges(&marks, 0).is_empty());
-        assert_eq!(link_ranges(&marks, 13), vec![LinkRange { start: 10, end: 11, definition: &marks[0].definition }, LinkRange { start: 12, end: 13, definition: &marks[0].definition }]);
+        assert_eq!(link_ranges(&marks, 13), vec![LinkRange { start: 10, end: 11, definition: &marks[0].definition, inference: None }, LinkRange { start: 12, end: 13, definition: &marks[0].definition, inference: None }]);
+    }
+
+    #[test]
+    fn inferred_calls_keep_destination_colors_reasons_and_visible_site_counts() {
+        let reason = "Rails belongs_to association";
+        let caller = SymbolRef { name: "caller".into(), file: "a.rb".into(), line: 1 };
+        let edge = |file: &str, inference: Option<&str>| CallEdge {
+            caller: caller.clone(), callee: SymbolRef { name: "run".into(), file: file.into(), line: 8 },
+            line: 1, start_column: 0, end_column: 3, inference: inference.map(str::to_owned),
+        };
+        let visible = HashSet::from(["a.rb".into(), "b.rb".into()]);
+        let highlights = CallHighlights::new(&[edge("b.rb", Some(reason)), edge("hidden.rb", Some(reason)), edge("a.rb", Some(reason))], &visible);
+        assert_eq!(highlights.site_count(), 1);
+        assert_eq!(highlights.inferred_site_count(), 1);
+        let marks = highlights.line("a.rb", 1);
+        assert_eq!(link_ranges(marks, 100)[0].inference, Some(reason));
+        let text = HighlightedText::new("a.rb", "run()");
+        assert!(paint_line(&text.lines[0], marks, None, true, 100).iter().any(|run| run.text == "run" && run.color == file_rgb("b.rb", None)));
+
+        let exact = mark(0, 3, "b.rb", "run", 8);
+        for marks in [vec![marks[0].clone(), exact.clone()], vec![exact, marks[0].clone()]] {
+            assert_eq!(link_ranges(&marks, 100)[0].inference, Some(reason));
+        }
+    }
+
+    #[test]
+    fn inferred_alternative_definitions_remain_neutral_and_unclickable() {
+        let mut inferred = mark(7, 10, "b.rb", "run", 8);
+        inferred.inference = Some("Inferred receiver type".into());
+        let marks = [mark(7, 10, "b.rb", "run", 4), inferred];
+        let text = HighlightedText::new("a.rb", "return run()");
+        assert!(link_ranges(&marks, 100).is_empty());
+        assert!(paint_line(&text.lines[0], &marks, None, true, 100).iter().any(|run| run.text == "run" && run.color == PLAIN));
     }
 }
