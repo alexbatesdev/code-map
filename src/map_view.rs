@@ -26,6 +26,24 @@ const TEXT_FROM_PX: f64 = 9.0;
 /// Hard cap on quads per frame, a safety net for huge projects.
 const QUAD_BUDGET: usize = 400_000;
 const LABEL_BUDGET: usize = 500;
+pub const DEFAULT_SHOW_IGNORED: bool = false;
+pub const DEFAULT_SYNTAX_COLORS: bool = true;
+
+#[derive(Clone, Copy, PartialEq)]
+enum ViewUpdate {
+    Fit,
+    Preserve,
+}
+
+#[derive(Clone, Copy)]
+struct SourceAnchor {
+    index: usize,
+    line: usize,
+    x: f64,
+    y: f64,
+    screen: DVec2,
+    line_px: f64,
+}
 
 script_mod! {
     use mod.prelude.widgets.*
@@ -153,12 +171,14 @@ pub struct CodeMap {
     root: PathBuf,
     #[rust]
     tree: Tree,
-    #[rust(true)]
+    #[rust(DEFAULT_SHOW_IGNORED)]
     show_ignored: bool,
     #[rust]
     needs_layout: bool,
     #[rust]
     needs_fit: bool,
+    #[rust]
+    source_anchor: Option<SourceAnchor>,
     /// The map's rectangle on screen, from the last draw.
     #[rust]
     view: Rect,
@@ -187,7 +207,7 @@ pub struct CodeMap {
     label_rects: Vec<Rect>,
     #[rust]
     color_mode: ColorMode,
-    #[rust]
+    #[rust(DEFAULT_SYNTAX_COLORS)]
     syntax_colors: bool,
     #[rust]
     call_highlights: CallHighlights,
@@ -252,6 +272,7 @@ impl CodeMap {
         self.selected = None;
         self.definition_focus = None;
         self.call_links.clear();
+        self.source_anchor = None;
         self.hover = None;
         self.history = None;
         self.graph = None;
@@ -296,7 +317,7 @@ impl CodeMap {
 
     pub fn set_show_ignored(&mut self, cx: &mut Cx, show: bool) {
         self.show_ignored = show;
-        self.apply_selection(cx);
+        self.apply_selection(cx, ViewUpdate::Fit);
     }
 
     pub fn set_filter(&mut self, cx: &mut Cx, query: &str) {
@@ -304,7 +325,7 @@ impl CodeMap {
             Ok(filter) => {
                 self.filter = filter;
                 self.filter_error = None;
-                self.apply_selection(cx);
+                self.apply_selection(cx, ViewUpdate::Fit);
             }
             Err(error) => {
                 self.filter_error = Some(error.clone());
@@ -315,7 +336,7 @@ impl CodeMap {
 
     pub fn set_hide_tests(&mut self, cx: &mut Cx, hide: bool) {
         self.hide_tests = hide;
-        self.apply_selection(cx);
+        self.apply_selection(cx, ViewUpdate::Fit);
     }
 
     pub fn set_syntax_colors(&mut self, cx: &mut Cx, on: bool) {
@@ -328,13 +349,15 @@ impl CodeMap {
         if mode > 0 && self.relationship_root.is_none() {
             self.trace_selected_in(cx, self.relationship_mode);
         } else {
-            self.refresh_relationships(cx);
+            self.refresh_relationships(cx, ViewUpdate::Fit);
         }
     }
 
     pub fn set_relationship_depth(&mut self, cx: &mut Cx, depth: usize) {
         self.relationship_depth = depth.clamp(1, 8);
-        self.refresh_relationships(cx);
+        if self.relationship_mode > 0 && self.graph.is_some() {
+            self.refresh_relationships(cx, ViewUpdate::Preserve);
+        }
     }
 
     pub fn trace_selected(&mut self, cx: &mut Cx) {
@@ -361,7 +384,7 @@ impl CodeMap {
         if self.graph.is_none() && !self.graph_loading {
             self.start_graph(cx);
         }
-        self.refresh_relationships(cx);
+        self.refresh_relationships(cx, ViewUpdate::Fit);
     }
 
     fn start_graph(&mut self, cx: &mut Cx) {
@@ -389,17 +412,23 @@ impl CodeMap {
         self.frame = cx.new_next_frame();
     }
 
-    fn refresh_relationships(&mut self, cx: &mut Cx) {
+    fn refresh_relationships(&mut self, cx: &mut Cx, view: ViewUpdate) {
         self.reachable = if self.relationship_mode > 0 {
             self.graph.as_ref().zip(self.relationship_root.as_deref()).map(|(graph, root)| {
                 graph.related(root, if self.relationship_mode == 2 { Direction::Callers } else { Direction::Callees }, self.relationship_depth)
             })
         } else { None };
-        self.apply_selection(cx);
+        self.apply_selection(cx, view);
     }
 
-    fn apply_selection(&mut self, cx: &mut Cx) {
-        self.definition_focus = None;
+    fn apply_selection(&mut self, cx: &mut Cx, view: ViewUpdate) {
+        let weights: Vec<_> = if view == ViewUpdate::Preserve {
+            self.tree.nodes.iter().map(|node| node.weight).collect()
+        } else { Vec::new() };
+        let anchor = if view == ViewUpdate::Preserve && !self.needs_layout && !self.needs_fit {
+            capture_source_anchor(&self.tree, self.view, self.cam_off, self.cam_scale)
+        } else { self.source_anchor };
+        if view == ViewUpdate::Fit { self.definition_focus = None; }
         self.tree.update_weights(self.show_ignored);
         self.tree.apply_filter(&self.filter, self.hide_tests, self.reachable.as_ref().map(|r| &r.paths));
         let visible = self.tree.nodes.iter().enumerate()
@@ -409,9 +438,28 @@ impl CodeMap {
         self.matches = self.tree.search(&self.search);
         self.match_cursor = 0;
         self.hover = None;
-        self.needs_layout = true;
         self.flight = None;
-        self.needs_fit = true;
+        if view == ViewUpdate::Fit {
+            self.needs_layout = true;
+            self.needs_fit = true;
+            self.source_anchor = None;
+        } else if self.tree.nodes.iter().map(|node| node.weight).ne(weights) {
+            self.needs_layout = true;
+            self.source_anchor = anchor;
+            if let Some(anchor) = self.source_anchor.as_mut().filter(|anchor| !self.tree.is_visible(anchor.index)) {
+                if let Some(index) = self.relationship_root.as_ref().and_then(|root| self.tree.find(root)).filter(|&i| self.tree.is_visible(i)) {
+                    anchor.index = index;
+                    anchor.line = 1;
+                    anchor.x = 0.1;
+                    anchor.y = 0.5;
+                    anchor.screen = self.view.size * 0.5;
+                    self.selected = Some(index);
+                }
+            }
+        }
+        if self.definition_focus.as_ref().is_some_and(|focus| self.tree.find(&focus.file).is_none_or(|i| !self.tree.is_visible(i))) {
+            self.definition_focus = None;
+        }
         if let Some(index) = self.selected.filter(|&i| self.tree.is_visible(i)) {
             cx.widget_action(self.uid, CodeMapAction::Selected(self.info(index)));
         } else if self.selected.is_some() {
@@ -460,6 +508,7 @@ impl CodeMap {
     }
 
     fn fly_to(&mut self, cx: &mut Cx, r: R, fill: f64) {
+        self.source_anchor = None;
         if self.view.size.x <= 0.0 || r.w <= 0.0 || r.h <= 0.0 {
             return;
         }
@@ -489,6 +538,7 @@ impl CodeMap {
     }
 
     fn jump_to_definition(&mut self, cx: &mut Cx, target: SymbolRef) {
+        self.source_anchor = None;
         let Some(index) = self.tree.find(&target.file) else { return };
         let Some(line) = self.definition_line_rect(index, target.line) else { return };
         self.flight = None;
@@ -560,7 +610,7 @@ impl CodeMap {
                     for entry in project.entries {
                         self.tree.insert(entry);
                     }
-                    self.tree.update_weights(true);
+                    self.tree.update_weights(self.show_ignored);
                     self.tree.apply_filter(&self.filter, self.hide_tests, None);
                     let text = format!(
                         "{}, scanned in {:.2}s ({})",
@@ -607,7 +657,7 @@ impl CodeMap {
                     self.graph = Some(graph);
                     self.graph_loading = false;
                     self.graph_read_errors = read_errors;
-                    self.refresh_relationships(cx);
+                    self.refresh_relationships(cx, ViewUpdate::Fit);
                 }
                 ScanMsg::Text(index, text) => {
                     self.text_pending.remove(&index);
@@ -988,6 +1038,7 @@ impl CodeMap {
                 }
             }
             Hit::FingerScroll(e) => {
+                self.source_anchor = None;
                 self.flight = None;
                 // zoom around the point under the mouse
                 let factor = (-e.scroll.y * 0.01).exp();
@@ -1022,6 +1073,12 @@ impl Widget for CodeMap {
         }
         if self.needs_layout {
             self.relayout();
+            if let Some(anchor) = self.source_anchor.take() {
+                if let Some((offset, scale)) = restore_source_anchor(&self.tree, anchor) {
+                    self.cam_off = offset;
+                    self.cam_scale = scale;
+                }
+            }
         }
         if self.tree.nodes[0].weight <= 0.0 {
             self.draw_label.color = vec4(0.7, 0.7, 0.7, 1.0);
@@ -1078,6 +1135,7 @@ impl Widget for CodeMap {
                 }
             }
             Hit::FingerDown(e) => {
+                self.source_anchor = None;
                 self.flight = None;
                 self.drag = Some(Drag {
                     start: e.abs,
@@ -1207,6 +1265,33 @@ fn draw_source_line(draw: &mut DrawText, cx: &mut Cx2d, line: &crate::syntax::Hi
     links
 }
 
+fn capture_source_anchor(tree: &Tree, view: Rect, offset: DVec2, scale: f64) -> Option<SourceAnchor> {
+    if scale <= 0.0 || !scale.is_finite() { return None; }
+    let center = offset + view.size * 0.5 / scale;
+    let index = tree.hit(center.x, center.y, 0.0)?;
+    let node = &tree.nodes[index];
+    if node.kind != Kind::Text || node.lines.is_empty() || node.line_h * scale < STRIPS_FROM_PX { return None; }
+    let inner = code_inner(node.rect);
+    let rows = node.lines.len().div_ceil(node.cols.max(1) as usize);
+    let col = ((center.x - inner.x) / (COL_CHARS * CHAR_W * node.line_h)).floor().max(0.0) as usize;
+    let row = ((center.y - inner.y) / node.line_h).floor().max(0.0) as usize;
+    let line = (col.min(node.cols.max(1) as usize - 1) * rows + row.min(rows - 1)).min(node.lines.len() - 1) + 1;
+    let rect = node.code_line_rect(line)?;
+    let x = ((center.x - rect.x) / rect.w).clamp(0.0, 1.0);
+    let y = ((center.y - rect.y) / rect.h).clamp(0.0, 1.0);
+    let point = dvec2(rect.x + rect.w * x, rect.y + rect.h * y);
+    Some(SourceAnchor { index, line, x, y, screen: (point - offset) * scale, line_px: rect.h * scale })
+}
+
+fn restore_source_anchor(tree: &Tree, anchor: SourceAnchor) -> Option<(DVec2, f64)> {
+    if !tree.is_visible(anchor.index) { return None; }
+    let rect = tree.nodes.get(anchor.index)?.code_line_rect(anchor.line)?;
+    let scale = anchor.line_px / rect.h;
+    if scale <= 0.0 || !scale.is_finite() { return None; }
+    let point = dvec2(rect.x + rect.w * anchor.x, rect.y + rect.h * anchor.y);
+    Some((point - anchor.screen / scale, scale))
+}
+
 fn definition_camera(line: R, indent: usize, length: usize, view: DVec2) -> (DVec2, f64) {
     let scale = (view.x / line.w * 0.9).max(18.0 / line.h);
     let start = line.x + indent.min(COL_CHARS as usize) as f64 * CHAR_W * line.h;
@@ -1322,6 +1407,46 @@ fn fmt_age(secs: i64) -> String {
 #[cfg(test)]
 mod navigation_tests {
     use super::*;
+
+    #[test]
+    fn source_position_and_readable_zoom_survive_a_trace_layout_change() {
+        let mut tree = Tree::new("project");
+        for (path, lines) in [("a.rb", 40), ("b.rb", 1800), ("c.rb", 50_000)] {
+            tree.insert(Entry { path: path.into(), kind: crate::scan::EntryKind::Text {
+                bytes: lines as u64, lines: vec![crate::scan::Line::default(); lines],
+            }, ignored: false });
+        }
+        tree.update_weights(false);
+        let world = R { x: 0.0, y: 0.0, w: 1060.0, h: 726.0 };
+        let visible = HashSet::from(["a.rb".into(), "b.rb".into()]);
+        tree.apply_filter(&Filter::default(), false, Some(&visible));
+        tree.layout(world);
+        let index = tree.find("b.rb").unwrap();
+        let columns = tree.nodes[index].cols;
+        let line = tree.nodes[index].code_line_rect(800).unwrap();
+        let view = Rect { pos: dvec2(0.0, 148.0), size: dvec2(1060.0, 726.0) };
+        let scale = 20.0 / line.h;
+        let offset = dvec2(line.x + line.w * 0.3, line.y + line.h * 0.4) - view.size * 0.5 / scale;
+        let anchor = capture_source_anchor(&tree, view, offset, scale).unwrap();
+        assert_eq!(anchor.line, 800);
+        let (same_offset, same_scale) = restore_source_anchor(&tree, anchor).unwrap();
+        assert!((same_offset - offset).length() < 1e-8);
+        assert!((same_scale - scale).abs() < 1e-8);
+
+        tree.apply_filter(&Filter::default(), false, None);
+        tree.layout(world);
+        assert_ne!(tree.nodes[index].cols, columns);
+        let (new_offset, new_scale) = restore_source_anchor(&tree, anchor).unwrap();
+        let line = tree.nodes[index].code_line_rect(800).unwrap();
+        let point = dvec2(line.x + line.w * anchor.x, line.y + line.h * anchor.y);
+        assert!(((point - new_offset) * new_scale - anchor.screen).length() < 1e-7);
+        assert!((line.h * new_scale - 20.0).abs() < 1e-8);
+
+        tree.apply_filter(&Filter::parse("a.rb").unwrap(), false, None);
+        tree.layout(world);
+        assert!(restore_source_anchor(&tree, anchor).is_none());
+        assert!(capture_source_anchor(&tree, view, offset, 0.0).is_none());
+    }
 
     #[test]
     fn definition_flights_keep_the_declaration_visible_in_narrow_maps() {

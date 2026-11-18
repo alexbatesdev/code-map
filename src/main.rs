@@ -66,8 +66,8 @@ script_mod! {
                             labels: ["File type" "Recently changed" "Most changed"]
                         }
                         fit_button := Button{text: "Fit"}
-                        show_ignored := CheckBox{text: "Show ignored" active: true}
-                        syntax_colors := CheckBox{text: "Syntax colors" active: false}
+                        show_ignored := CheckBox{text: "Show ignored" active: #(map_view::DEFAULT_SHOW_IGNORED)}
+                        syntax_colors := CheckBox{text: "Syntax colors" active: #(map_view::DEFAULT_SYNTAX_COLORS)}
                     }
                     filters := View{
                         width: Fill height: 38

@@ -17,8 +17,9 @@ original map. The viewer uses a zoomable 2D treemap.
   same. The status bar also reports reached methods and cross-file call sites.
   Gold marks the root; other files have stable colors. Resolved calls in the
   source use the same color as their destination file, including in the line
-  minimaps. Ordinary source text is neutral by default; **Syntax colors** opts
-  back into language colors while retaining call colors.
+  minimaps. **Syntax colors** starts on and can be turned off for neutral source
+  text while retaining call colors. Changing depth preserves the current view
+  and readable source position; starting a new trace fits the map.
   Select a connected file for the method names and call-site lines that explain
   its connection. Select **All files** to leave the relationship view.
 - **Jump to definition:** at readable source zoom, click a colored call name
@@ -59,8 +60,8 @@ Fly over a codebase as a zoomable GPU treemap. Based on
 
 - Every file is a box sized by its line count, grouped by folder. Zoom in far enough and the
   actual code appears inside the box.
-- Respects `.gitignore` (the file list comes from `git ls-files`). Ignored entries show up as
-  striped collapsed boxes and are only read when you click them.
+- Respects `.gitignore` (the file list comes from `git ls-files`). Ignored entries are hidden
+  by default. **Show ignored** reveals striped collapsed boxes, read only when clicked.
 - Search: type to highlight matches, Enter flies to the next one, Escape clears.
 - Git heatmap: color by "Recently changed" or "Most changed" instead of file type.
 
