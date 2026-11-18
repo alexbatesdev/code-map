@@ -1,6 +1,6 @@
 //! Code Map: fly over a codebase as a zoomable GPU treemap.
 //!
-//!   cargo run --release -- /path/to/project [--3d]
+//!   cargo run --release -- /path/to/project
 //!   cargo run --release --bin scan -- /path/to/project   (no window, just stats)
 
 pub use makepad_widgets;
@@ -12,7 +12,6 @@ mod relationships;
 mod syntax;
 mod map_view;
 mod model;
-mod orbit;
 mod scan;
 
 use makepad_widgets::*;
@@ -58,7 +57,6 @@ script_mod! {
                             width: 150
                             labels: ["File type" "Recently changed" "Most changed"]
                         }
-                        three_d := CheckBox{text: "3D" active: false}
                         fit_button := Button{text: "Fit"}
                         show_ignored := CheckBox{text: "Show ignored" active: true}
                         syntax_colors := CheckBox{text: "Syntax colors" active: false}
@@ -92,7 +90,7 @@ script_mod! {
                             labels: ["1" "2" "3" "5" "8"]
                         }
                         relationship_root := InfoLabel{width: Fill text: "Select a source file to trace its calls"}
-                        InfoLabel{text: "Call colors match files · Click a call to jump (2D)"}
+                        InfoLabel{text: "Call colors match files · Click a call to jump"}
                     }
                     View{
                         width: Fill height: Fill
@@ -119,7 +117,7 @@ script_mod! {
                                 info_details := InfoLabel{text: ""}
                             }
                             InfoLabel{
-                                text: "Scroll: zoom\nDrag: pan (2D) or orbit (3D)\nShift or right drag: pan (3D)\nClick: inspect\nDouble click: fly to it\nEnter in search: next match\nStriped boxes are ignored by git.\nClick one to read it."
+                                text: "Scroll: zoom\nDrag: pan\nClick: inspect\nColored call: jump to definition\nDouble click: fly to it\nEnter in search: next match\nStriped boxes are ignored by git.\nClick one to read it."
                             }
                         }
                     }
@@ -185,10 +183,6 @@ impl MatchEvent for App {
         self.ui.label(cx, ids!(title)).set_text(cx, &format!("Code Map: {}", path.display()));
         let map = self.ui.code_map(cx, ids!(map));
         map.open(cx, path);
-        if std::env::args().any(|a| a == "--3d") {
-            self.ui.check_box(cx, ids!(three_d)).set_active(cx, true, Animate::No);
-            map.set_3d(cx, true);
-        }
     }
 
     fn handle_actions(&mut self, cx: &mut Cx, actions: &Actions) {
@@ -216,9 +210,6 @@ impl MatchEvent for App {
         }
         if self.ui.button(cx, ids!(trace_selected)).clicked(actions) {
             map.trace_selected(cx);
-        }
-        if let Some(on) = self.ui.check_box(cx, ids!(three_d)).changed(actions) {
-            map.set_3d(cx, on);
         }
         if let Some(index) = self.ui.drop_down(cx, ids!(color_mode)).changed(actions) {
             let mode = match index {

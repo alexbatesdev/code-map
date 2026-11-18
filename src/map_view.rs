@@ -1,12 +1,8 @@
-//! The map widget: draws the tree as nested rectangles (2D) or as a city of
-//! boxes (3D) and lets you fly around it.
+//! The map widget: draws the tree as nested rectangles and lets you fly around it.
 //!
-//! 2D: everything is a quad drawn by one tiny pixel shader. Makepad batches
+//! Everything is a quad drawn by one tiny pixel shader. Makepad batches
 //! all quads of the same shader into one GPU draw call, which is why drawing
 //! a hundred thousand of them per frame is fine.
-//! 3D: see `city.rs`.
-
-mod city;
 
 use crate::history::{self, History};
 use crate::call_colors::{self, CallHighlights, CallMark};
@@ -14,7 +10,6 @@ use crate::filter::Filter;
 use crate::relationships::{supports_path, Direction, Graph, Reachability, SourceFile, SymbolRef};
 use crate::syntax::HighlightedText;
 use crate::model::{code_inner, frame, ColorMode, Kind, Tree, CHAR_W, COL_CHARS, R};
-use crate::orbit::Orbit;
 use crate::scan::{self, Entry};
 use makepad_widgets::*;
 use std::{
@@ -57,25 +52,12 @@ script_mod! {
         }
     }
 
-    // Shows the offscreen 3D render (a texture) as a flat quad in the UI,
-    // like rendering a Three.js scene to a WebGLRenderTarget.
-    set_type_default() do #(DrawSceneTexture::script_shader(vm)){
-        ..mod.draw.DrawQuad
-        scene_texture: texture_2d(float)
-        pixel: fn() {
-            let c = self.scene_texture.sample_as_bgra(self.pos)
-            return vec4(c.rgb * c.w, c.w)
-        }
-    }
-
     mod.widgets.CodeMapBase = #(CodeMap::register_widget(vm))
     mod.widgets.CodeMap = set_type_default() do mod.widgets.CodeMapBase{
         width: Fill
         height: Fill
         draw_bg +: {color: #x07090c}
         draw_block +: {}
-        draw_scene +: {}
-        draw_cube +: {}
         draw_label +: {
             color: #xe6ebf0
             text_style: theme.font_regular{font_size: 8.0}
@@ -100,13 +82,6 @@ pub struct DrawBlock {
     border: f32,
     #[live]
     hatch: f32,
-}
-
-#[derive(Script, ScriptHook)]
-#[repr(C)]
-pub struct DrawSceneTexture {
-    #[deref]
-    draw_super: DrawQuad,
 }
 
 /// What the app shows in the inspector panel.
@@ -148,12 +123,10 @@ struct CallLink {
 #[derive(Clone, Copy)]
 struct Drag {
     start: DVec2,
-    last: DVec2,
     start_off: DVec2,
     moved: bool,
     taps: u32,
-    /// Right button or shift: pan instead of orbit (3D only).
-    pan: bool,
+    follow_link: bool,
 }
 
 #[derive(Script, ScriptHook, Widget)]
@@ -172,29 +145,9 @@ pub struct CodeMap {
     #[live]
     draw_block: DrawBlock,
     #[live]
-    draw_scene: DrawSceneTexture,
-    #[live]
-    draw_cube: DrawCube,
-    #[live]
     draw_label: DrawText,
     #[live]
     draw_code: DrawText,
-
-    // 3D render target: its own render pass with color and depth textures.
-    // `#[new]` means "create this with ::new(cx)" when the widget is built.
-    #[new]
-    pass: DrawPass,
-    #[new]
-    draw_list: DrawList,
-    #[new]
-    color_texture: Texture,
-    #[new]
-    depth_texture: Texture,
-    #[rust]
-    pass_ready: bool,
-    /// One draw list per file whose code is shown on its tower top in 3D.
-    #[rust]
-    code_lists: Vec<DrawList>,
 
     #[rust]
     root: PathBuf,
@@ -212,30 +165,18 @@ pub struct CodeMap {
     /// World size of the whole map.
     #[rust]
     world: R,
-    /// 2D camera: screen = view.pos + (world - cam_off) * cam_scale
+    /// Camera: screen = view.pos + (world - cam_off) * cam_scale
     #[rust]
     cam_scale: f64,
     #[rust]
     cam_off: DVec2,
-    /// Where a double click is flying the 2D camera to: (world center, scale).
+    /// Where a double click is flying the camera to: (world center, scale).
     #[rust]
     flight: Option<(DVec2, f64)>,
-    #[rust]
-    mode_3d: bool,
-    #[rust]
-    orbit: Orbit,
-    /// Where the 3D camera is flying to: (target, distance).
-    #[rust]
-    orbit_flight: Option<(Vec3f, f32)>,
-    /// Boxes drawn in the last 3D frame, for mouse picking.
-    #[rust]
-    picks: Vec<(usize, Vec3f, Vec3f)>,
     #[rust]
     drag: Option<Drag>,
     #[rust]
     hover: Option<usize>,
-    #[rust]
-    hover_abs: DVec2,
     #[rust]
     selected: Option<usize>,
     #[rust]
@@ -470,9 +411,7 @@ impl CodeMap {
         self.hover = None;
         self.needs_layout = true;
         self.flight = None;
-        self.orbit_flight = None;
         self.needs_fit = true;
-        if self.mode_3d { self.fit(cx); }
         if let Some(index) = self.selected.filter(|&i| self.tree.is_visible(i)) {
             cx.widget_action(self.uid, CodeMapAction::Selected(self.info(index)));
         } else if self.selected.is_some() {
@@ -515,41 +454,9 @@ impl CodeMap {
         self.fly_to_node(cx, index);
     }
 
-    pub fn set_3d(&mut self, cx: &mut Cx, on: bool) {
-        if on == self.mode_3d || self.cam_scale <= 0.0 {
-            self.mode_3d = on;
-            self.redraw(cx);
-            return;
-        }
-        // keep looking at the same spot when switching
-        let k = self.scale_3d() as f64;
-        let tan_half = (self.orbit.fov_y.to_radians() * 0.5).tan() as f64;
-        if on {
-            let center = self.cam_off + self.view.size * 0.5 / self.cam_scale;
-            self.orbit.target = vec3f(((center.x - self.world.w * 0.5) * k) as f32, 0.0, ((center.y - self.world.h * 0.5) * k) as f32);
-            let visible = self.view.size.y / self.cam_scale * k;
-            self.orbit.distance = (visible / (2.0 * tan_half)) as f32;
-        } else {
-            let t = self.orbit.target;
-            let center = dvec2(t.x as f64 / k + self.world.w * 0.5, t.z as f64 / k + self.world.h * 0.5);
-            let visible = self.orbit.distance as f64 * 2.0 * tan_half / k;
-            self.cam_scale = self.view.size.y / visible.max(1e-9);
-            self.cam_off = center - self.view.size * 0.5 / self.cam_scale;
-        }
-        self.mode_3d = on;
-        self.flight = None;
-        self.orbit_flight = None;
-        self.redraw(cx);
-    }
-
     pub fn fit(&mut self, cx: &mut Cx) {
-        if self.mode_3d {
-            self.orbit_flight = Some((vec3f(0.0, 0.0, 0.0), 13.0));
-            self.frame = cx.new_next_frame();
-        } else {
-            let world = self.world;
-            self.fly_to(cx, world, 1.0);
-        }
+        let world = self.world;
+        self.fly_to(cx, world, 1.0);
     }
 
     fn fly_to(&mut self, cx: &mut Cx, r: R, fill: f64) {
@@ -562,12 +469,8 @@ impl CodeMap {
     }
 
     fn fly_to_node(&mut self, cx: &mut Cx, index: usize) {
-        if self.mode_3d {
-            self.fly_3d(cx, index);
-        } else {
-            let r = self.tree.nodes[index].rect;
-            self.fly_to(cx, r, 0.95);
-        }
+        let r = self.tree.nodes[index].rect;
+        self.fly_to(cx, r, 0.95);
     }
 
     fn select(&mut self, cx: &mut Cx, index: usize) {
@@ -586,11 +489,9 @@ impl CodeMap {
     }
 
     fn jump_to_definition(&mut self, cx: &mut Cx, target: SymbolRef) {
-        if self.mode_3d { return; }
         let Some(index) = self.tree.find(&target.file) else { return };
         let Some(line) = self.definition_line_rect(index, target.line) else { return };
         self.flight = None;
-        self.orbit_flight = None;
         let source = self.tree.nodes[index].lines[target.line - 1];
         self.flight = Some(definition_camera(line, source.indent as usize, source.len as usize, self.view.size));
         self.frame = cx.new_next_frame();
@@ -604,7 +505,6 @@ impl CodeMap {
 
     fn call_at(&self, abs: DVec2) -> Option<SymbolRef> {
         if !self.view.contains(abs) || self.label_rects.iter().any(|r| r.contains(abs)) { return None; }
-        if self.mode_3d { return None; }
         self.call_links.iter().find(|link| link.rect.contains(abs)).map(|link| link.target.clone())
     }
 
@@ -761,9 +661,6 @@ impl CodeMap {
     fn hit(&self, abs: DVec2) -> Option<usize> {
         if self.tree.is_empty() || self.cam_scale <= 0.0 {
             return None;
-        }
-        if self.mode_3d {
-            return self.pick_3d(abs);
         }
         let p = self.to_world(abs);
         self.tree.hit(p.x, p.y, 3.0 / self.cam_scale)
@@ -1075,7 +972,7 @@ impl CodeMap {
         self.labels.clear();
     }
 
-    fn handle_2d_input(&mut self, cx: &mut Cx, hit: Hit) {
+    fn handle_input(&mut self, cx: &mut Cx, hit: Hit) {
         match hit {
             Hit::FingerMove(e) => {
                 if let Some(mut drag) = self.drag {
@@ -1140,19 +1037,15 @@ impl Widget for CodeMap {
         }
 
         self.labels.clear();
-        if self.mode_3d {
-            self.draw_3d(cx, rect);
-        } else {
-            self.draw_map(cx);
-            if let Some(h) = self.hover {
-                if self.tree.is_visible(h) {
-                    self.outline(cx, h, vec4(1.0, 1.0, 1.0, 0.5), 1.5);
-                }
+        self.draw_map(cx);
+        if let Some(h) = self.hover {
+            if self.tree.is_visible(h) {
+                self.outline(cx, h, vec4(1.0, 1.0, 1.0, 0.5), 1.5);
             }
-            if let Some(s) = self.selected {
-                if self.tree.is_visible(s) {
-                    self.outline(cx, s, vec4(0.35, 0.85, 1.0, 1.0), 2.5);
-                }
+        }
+        if let Some(s) = self.selected {
+            if self.tree.is_visible(s) {
+                self.outline(cx, s, vec4(0.35, 0.85, 1.0, 1.0), 2.5);
             }
         }
         self.draw_labels(cx);
@@ -1164,7 +1057,6 @@ impl Widget for CodeMap {
         if self.frame.is_event(event).is_some() {
             self.drain(cx);
             self.step_flight(cx);
-            self.step_orbit_flight(cx);
             if self.pending > 0 {
                 self.frame = cx.new_next_frame();
             }
@@ -1174,7 +1066,6 @@ impl Widget for CodeMap {
             Hit::FingerHoverIn(e) | Hit::FingerHoverOver(e) => {
                 cx.set_cursor(if self.call_at(e.abs).is_some() { MouseCursor::Hand } else { MouseCursor::Default });
                 let hover = self.hit(e.abs);
-                self.hover_abs = e.abs;
                 if hover != self.hover {
                     self.hover = hover;
                     self.redraw(cx);
@@ -1188,21 +1079,19 @@ impl Widget for CodeMap {
             }
             Hit::FingerDown(e) => {
                 self.flight = None;
-                self.orbit_flight = None;
                 self.drag = Some(Drag {
                     start: e.abs,
-                    last: e.abs,
                     start_off: self.cam_off,
                     moved: false,
                     taps: e.tap_count,
-                    pan: !e.device.is_primary_hit() || e.modifiers.shift,
+                    follow_link: e.device.is_primary_hit() && !e.modifiers.shift,
                 });
             }
             Hit::FingerUp(e) => {
                 cx.set_cursor(MouseCursor::Default);
                 if let Some(drag) = self.drag.take() {
                     if !drag.moved {
-                        if !drag.pan {
+                        if drag.follow_link {
                             if let Some(target) = self.call_at(drag.start).filter(|target| self.call_at(e.abs).as_ref() == Some(target)) {
                                 self.jump_to_definition(cx, target);
                                 return;
@@ -1224,11 +1113,7 @@ impl Widget for CodeMap {
         if self.cam_scale <= 0.0 {
             return;
         }
-        if self.mode_3d {
-            self.handle_3d_input(cx, hit);
-        } else {
-            self.handle_2d_input(cx, hit);
-        }
+        self.handle_input(cx, hit);
     }
 }
 
@@ -1284,11 +1169,6 @@ impl CodeMapRef {
     pub fn next_match(&self, cx: &mut Cx) {
         if let Some(mut inner) = self.borrow_mut() {
             inner.next_match(cx);
-        }
-    }
-    pub fn set_3d(&self, cx: &mut Cx, on: bool) {
-        if let Some(mut inner) = self.borrow_mut() {
-            inner.set_3d(cx, on);
         }
     }
 }
@@ -1405,10 +1285,6 @@ fn hsv(h: f32, s: f32, v: f32) -> Vec4f {
 
 fn scale_rgb(c: Vec4f, k: f32) -> Vec4f {
     vec4(c.x * k, c.y * k, c.z * k, c.w)
-}
-
-fn mix_rgb(a: Vec4f, b: Vec4f, t: f32) -> Vec4f {
-    vec4(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t, a.z + (b.z - a.z) * t, a.w)
 }
 
 pub fn fmt_num(n: u64) -> String {

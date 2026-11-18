@@ -438,17 +438,6 @@ impl Tree {
         matches
     }
 
-    /// The top-level folder a node lives in (for coloring regions in 3D).
-    pub fn top_level(&self, mut index: usize) -> usize {
-        while let Some(parent) = self.nodes[index].parent {
-            if parent == 0 {
-                return index;
-            }
-            index = parent;
-        }
-        index
-    }
-
     /// The deepest laid-out node under a world point.
     pub fn hit(&self, x: f64, y: f64, min_size: f64) -> Option<usize> {
         if self.nodes[0].weight <= 0.0 || !self.nodes[0].rect.contains(x, y) {

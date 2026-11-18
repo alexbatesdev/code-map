@@ -3,7 +3,7 @@
 ## Explorer fork
 
 This fork adds file filtering, static call paths, and syntax highlighting to the
-original map. The normal file map stays available in both 2D and 3D.
+original map. The viewer uses a zoomable 2D treemap.
 
 - **Filter:** space-separated terms are ANDed; `|` joins OR groups; `-term`
   excludes a path. Examples: `app/ | webpack/`, `app/ -controllers/`, `**/*.tsx`.
@@ -21,7 +21,7 @@ original map. The normal file map stays available in both 2D and 3D.
   back into language colors while retaining call colors.
   Select a connected file for the method names and call-site lines that explain
   its connection. Select **All files** to leave the relationship view.
-- **Jump to definition (2D):** at readable source zoom, click a colored call name
+- **Jump to definition:** at readable source zoom, click a colored call name
   to fly to the resolved declaration. Its line is highlighted and the inspector
   shows the method and line number. The trace root, filters and depth stay put.
   Only resolved colored calls are links; dynamic or ambiguous calls remain plain.
@@ -29,7 +29,7 @@ original map. The normal file map stays available in both 2D and 3D.
   at readable zoom. The inspector lists their source lines and columns. Incoming
   call sites are in the caller files; select one to see its calls into the root.
   Optional Ruby, JS/JSX and TS/TSX syntax colors use Tree-sitter. Parsing runs on a background worker and is
-  cached for both map views. Unsupported languages and files above 2 MiB retain
+  cached. Unsupported languages and files above 2 MiB retain
   plain text. The code map's existing column clipping still applies.
 - **Loading:** a gold Triforce pulses in the bottom-right corner while background
   scans, history, call indexing, folder expansion or source loading are pending.
@@ -64,7 +64,6 @@ the GPU. Inspired by Rik Arends' "Makepad Scope" demo.
   striped collapsed boxes and are only read when you click them.
 - Search: type to highlight matches, Enter flies to the next one, Escape clears.
 - Git heatmap: color by "Recently changed" or "Most changed" instead of file type.
-- 3D city mode: folders become districts, files become towers with their code on the roof.
 
 ## Setup
 
@@ -85,8 +84,7 @@ build.
 
 ```sh
 cd code-map
-cargo run --release -- /path/to/some/project          # 2D treemap
-cargo run --release -- /path/to/some/project --3d     # start in 3D city mode
+cargo run --release -- /path/to/some/project
 ```
 
 The first build compiles Makepad and takes a few minutes. Later builds are fast. Without a path
@@ -105,9 +103,9 @@ cargo run --release --bin scan -- /path/to/some/project [ignored/path ...]
 | Input | Action |
 | --- | --- |
 | Scroll | Zoom |
-| Drag | Pan (2D) or orbit (3D) |
-| Shift drag or right drag | Pan (3D) |
+| Drag | Pan |
 | Click | Inspect a file or folder |
+| Click a colored call | Jump to its definition |
 | Double click | Fly to it |
 | Enter in search | Next match |
 
@@ -120,8 +118,6 @@ cargo run --release --bin scan -- /path/to/some/project [ignored/path ...]
 | `src/model.rs` | Treemap layout and colors |
 | `src/history.rs` | Reads `git log` for the heatmap modes |
 | `src/map_view.rs` | The custom `CodeMap` widget: drawing, zoom, picking, search |
-| `src/map_view/city.rs` | 3D city rendering (offscreen pass, cubes, projected labels) |
-| `src/orbit.rs` | Orbit camera for 3D mode |
 
 Tested on macOS. Makepad also targets Windows, Linux and web, but this app has not been tried
 there.
