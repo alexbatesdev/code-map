@@ -33,6 +33,8 @@ pub struct App {
     pressed: Option<String>,
     editing_drag: bool,
     pointer: (f64, f64),
+    tooltip_hover: Option<(String, Instant)>,
+    tooltip_visible: bool,
     popup: Option<(&'static str, usize)>,
     map_rect: R,
     inspector: R,
@@ -53,12 +55,34 @@ impl App {
             map.set_evidence_input(EvidenceInput::File(path));
         }
         Ok(Self { map, running: true, width: 1400.0, height: 900.0, scale: 1.0, editors,
-            widgets: Vec::new(), focus: None, pressed: None, editing_drag: false, pointer: (0.0, 0.0),
+            widgets: Vec::new(), focus: None, pressed: None, editing_drag: false, pointer: (0.0, 0.0), tooltip_hover: None, tooltip_visible: false,
             popup: None, map_rect: R::default(), inspector: R::default(), inspector_scroll: 0.0,
             inspector_limit: 0.0, detail_cache: None, buffer: None, local_status: None, started: Instant::now() })
     }
 
-    pub fn tick(&mut self) -> bool { self.map.tick() }
+    pub fn tick(&mut self) -> bool {
+        let dirty = self.map.tick();
+        if !self.tooltip_visible && self.tooltip_hover.as_ref().is_some_and(|(_, since)| since.elapsed().as_millis() >= 500) {
+            self.tooltip_visible = true;
+            return true;
+        }
+        dirty
+    }
+
+    fn dismiss_tooltip(&mut self) {
+        self.tooltip_hover = None;
+        self.tooltip_visible = false;
+    }
+
+    fn update_tooltip_hover(&mut self) {
+        let target = if self.popup.is_none() && self.pressed.is_none() && !self.editing_drag {
+            self.widgets.iter().rev().find(|widget| widget.rect.contains(self.pointer.0, self.pointer.1) && control_help(&widget.action).is_some()).map(|widget| widget.id.as_str())
+        } else { None };
+        if target != self.tooltip_hover.as_ref().map(|(id, _)| id.as_str()) {
+            self.tooltip_hover = target.map(|id| (id.to_owned(), Instant::now()));
+            self.tooltip_visible = false;
+        }
+    }
 
     fn add(&mut self, id: &str, ty: &'static str, rect: R, text: impl Into<String>, value: Option<String>, checked: Option<bool>, action: Action) {
         self.widgets.push(Widget { id: id.into(), ty, rect, text: text.into(), value, checked, action });
@@ -217,6 +241,7 @@ impl App {
             self.widgets.push(Widget { id: format!("call_{i}"), ty: "CallLink", rect: link.rect, text: format!("{} at {}:{} · {}", link.target.definition.name, link.target.definition.file, link.target.definition.line, link.target.evidence.label()), value: None, checked: None, action: Action::None });
         }
         self.draw_popup(backend, screen);
+        self.draw_tooltip(backend, screen);
         self.sync_input(backend);
         let elements: Vec<_> = self.widgets.iter().filter(|widget| !matches!(widget.action, Action::None)).map(|widget| Accessibility {
             id: id_hash(&widget.id), role: match widget.ty { "TextInput" => AccessibilityRole::Text, "CheckBox" => AccessibilityRole::CheckBox, "DropDown" => AccessibilityRole::Popup, _ => AccessibilityRole::Button },
@@ -241,6 +266,26 @@ impl App {
             self.widgets.push(Widget { id: format!("{id}.item.{index}"), ty: "PopupMenuItem", rect, text: (*text).into(), value: None, checked: Some(index == selected), action: Action::Choose(id,index) });
         }
         self.buffer = Some(canvas.into_buffer());
+    }
+
+    fn draw_tooltip(&mut self, backend: &mut Backend, screen: R) {
+        if !self.tooltip_visible { return; }
+        let target = self.tooltip_hover.as_ref().and_then(|(id, _)| self.widgets.iter().find(|widget| widget.id == *id && widget.rect.contains(self.pointer.0, self.pointer.1)));
+        let Some((anchor, help)) = target.and_then(|widget| control_help(&widget.action).map(|help| (widget.rect, help))) else { self.dismiss_tooltip(); return; };
+        let mut canvas = Canvas::with_buffer(backend, self.buffer.take().unwrap_or_default());
+        let width = 420.0_f64.min(screen.w - 16.0);
+        let lines = wrap(&canvas, help, width - 20.0, FONT);
+        let height = 16.0 + lines.len() as f64 * 17.0;
+        let below = anchor.y + anchor.h + 8.0;
+        let y = if below + height <= screen.h - 8.0 { below } else { (anchor.y - height - 8.0).max(8.0) };
+        let rect = R { x: anchor.x.clamp(8.0, (screen.w - width - 8.0).max(8.0)), y, w: width, h: height };
+        canvas.rect(R { x: rect.x+3.0, y: rect.y+3.0, ..rect }, [0.0,0.0,0.0,0.55], [0.0;4], 0.0, 0.0, screen);
+        canvas.rect(rect, [0.12,0.16,0.19,1.0], ACCENT, 1.0, 0.0, screen);
+        for (index, line) in lines.iter().enumerate() {
+            canvas.text(line, rect.x+10.0, rect.y+8.0+index as f64*17.0, FONT, TEXT, inset(rect, 8.0, 6.0), true);
+        }
+        self.buffer = Some(canvas.into_buffer());
+        self.add("tooltip", "Tooltip", rect, help, None, None, Action::None);
     }
 
     fn focused_field(&self) -> Option<Field> {
@@ -328,12 +373,14 @@ impl App {
     }
 
     pub fn handle(&mut self, event: Event, backend: &mut Backend) {
+        if !matches!(&event, Event::PointerMove { .. }) { self.dismiss_tooltip(); }
         let was_composing = self.focused_field().is_some_and(|field| self.editors[field.index()].is_composing());
         match event {
             Event::Close => self.running=false,
             Event::Resize {width,height,scale} => { self.width=width;self.height=height;self.scale=scale;self.layout(); }
             Event::PointerMove {x,y,..} => {
                 self.pointer=(x,y);
+                self.update_tooltip_hover();
                 if self.editing_drag {
                     if let Some(field)=self.focused_field() { self.caret_from_pointer(field,x,true,backend); }
                 } else { self.map.pointer_move(x,y); }
@@ -462,6 +509,7 @@ impl App {
         let widgets:Vec<_>=self.widgets.iter().filter(|widget|all||widget.rect.w>0.0&&widget.rect.h>0.0).filter(|widget|query.is_none_or(|q|widget.id.contains(q)||widget.ty.contains(q)||widget.text.contains(q)||widget.value.as_ref().is_some_and(|value|value.contains(q)))).map(|widget|{
             let mut value=json!({"i":widget.id,"ty":widget.ty,"r":[widget.rect.x,widget.rect.y,widget.rect.w,widget.rect.h],"w":0,"enabled":true,"t":widget.text});
             if let Some(text)=&widget.value {value["val"]=json!(text);if widget.ty=="DropDown" {value["selected"]=json!(text);}}
+            if let Some(help)=control_help(&widget.action) {value["help"]=json!(help);}
             if let Some(checked)=widget.checked {value["c"]=json!(u8::from(checked));}
             value
         }).collect();
@@ -501,4 +549,30 @@ fn wrap(canvas:&Canvas,text:&str,width:f64,size:f64)->Vec<String> {
         lines.push(line);
     }
     lines
+}
+
+fn control_help(action: &Action) -> Option<&'static str> {
+    let id = match action {
+        Action::Field(field) => field.id(),
+        Action::Button(id) | Action::Toggle(id) | Action::Drop(id) | Action::Choose(id, _) => id,
+        Action::None => return None,
+    };
+    Some(match id {
+        "search" => "Find files and folders by name or path. Press Enter to fly to the next match; Escape clears the search. Command-F focuses this field.",
+        "fit_button" => "Zoom out to fit the currently visible files in the window. Keeps your filters and trace selection.",
+        "show_ignored" => "Show files and folders excluded by ignore rules. Ignored entries stay collapsed until you click them to read their contents.",
+        "syntax_colors" => "Color Ruby, JavaScript and TypeScript syntax when zoomed in enough to read code. Colored relationship calls remain visible with this off.",
+        "color_mode" => "Color files by file type, most recent change, or change frequency. Change-based colors use the repository's Git history.",
+        "hide_tests" => "Hide spec and test files and directories from the map and relationship traces.",
+        "filter_query" => "Limit the map to matching paths. Space-separated terms mean AND; | means OR; a leading - excludes a term. Globs such as app/**/*.rb work too. Command-Shift-F focuses this field.",
+        "relationship_mode" => "Show all files, follow calls made by the trace root, or find callers of the trace root. Select a file and use Trace selected to choose the root.",
+        "trace_selected" => "Use the selected file as the root of a relationship trace and fit the results in the window. Starts with outgoing calls when viewing All files.",
+        "relationship_depth" => "Choose how many method-call hops to follow. Depth 1 includes direct relationships; deeper calls may stay within the same files. Changing depth keeps your position and zoom.",
+        "evidence_mode" => "Choose which relationship evidence to follow: source-resolved calls, labeled inferences, loaded Rails metadata, or observed execution. Observed calls cover only the paths exercised during their capture.",
+        "evidence_path" => "Path to an optional saved relationship snapshot (a JSON file), then click Load snapshot. Relative paths start at the mapped project's directory.",
+        "evidence_load" => "Load the JSON file named on the left. A snapshot contains Rails method and association metadata or recorded calls, adding relationships source analysis can miss. The app can be offline. Missing or stale data falls back to source analysis.",
+        "evidence_capture" => "Start this project's Rails development environment to collect method and association metadata, with a 45-second limit. Requires a working Ruby/Rails setup. Runs only when clicked; unavailable app data falls back to source analysis.",
+        "evidence_clear" => "Remove imported or captured app data and use source analysis, including labeled Rails inferences. Does not change files in the project.",
+        _ => return None,
+    })
 }

@@ -160,6 +160,9 @@ cargo run --release --bin scan -- /path/to/some/project [ignored/path ...]
 
 ## Controls
 
+Hover over a toolbar control for a short explanation. Help appears after half a
+second and closes when you leave the control or interact with the app.
+
 | Input | Action |
 | --- | --- |
 | Scroll | Zoom |
