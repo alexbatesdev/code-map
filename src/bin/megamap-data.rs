@@ -1,4 +1,4 @@
-use megamap::{evidence_input, web_project::{Project, MAX_INPUT, MAX_OUTPUT}};
+use megamap::{pr_project::ComparisonProject, evidence_input, web_project::{Project, MAX_INPUT, MAX_OUTPUT}};
 use serde_json::{json, Value};
 use std::{io::{self, BufRead, Write}, path::PathBuf, sync::{mpsc, Arc, atomic::{AtomicUsize, Ordering}}};
 
@@ -37,15 +37,25 @@ fn read_requests(reader: &mut impl BufRead, sender: mpsc::Sender<Result<Vec<u8>,
         if sender.send(frame).is_err() || failed { break; }
     }
 }
+enum WorkerProject { Ordinary(Project), Comparison(ComparisonProject) }
+impl WorkerProject {
+    fn request(&mut self, request: &Value) -> Value {
+        match self { Self::Ordinary(project) => project.request(request), Self::Comparison(project) => project.request(request) }
+    }
+}
+
 fn run() -> Result<(), String> {
-    let mut args = std::env::args_os().skip(1); let mut root = None; let mut capture = false;
+    let mut args = std::env::args_os().skip(1); let mut root = None; let mut capture = false; let mut comparison = None;
     while let Some(arg) = args.next() {
         if arg == "--root" { if root.is_some() { return Err("pass --root once".into()); } root = Some(PathBuf::from(args.next().ok_or("--root needs a path")?)); }
+        else if arg == "--comparison" { if comparison.is_some() { return Err("pass --comparison once".into()); } comparison = Some(PathBuf::from(args.next().ok_or("--comparison needs a manifest path")?)); }
         else if arg == "--allow-capture" { capture = true; }
-        else if arg == "--help" { println!("megamap-data --root PATH [--allow-capture]"); return Ok(()); }
+        else if arg == "--help" { println!("megamap-data --root PATH [--allow-capture] [--comparison MANIFEST]"); return Ok(()); }
         else { return Err("unknown argument; use --root PATH [--allow-capture]".into()); }
     }
-    let mut project = Project::new(&root.ok_or("--root PATH is required")?, capture)?;
+    let root = root.ok_or("--root PATH is required")?;
+    if comparison.is_some() && capture { return Err("Rails capture is unavailable for immutable PR revisions".into()); }
+    let mut project = if let Some(manifest) = comparison { WorkerProject::Comparison(ComparisonProject::new(&manifest, &root)?) } else { WorkerProject::Ordinary(Project::new(&root, capture)?) };
     struct CaptureGuard;
     impl Drop for CaptureGuard { fn drop(&mut self) { evidence_input::cancel_capture(); } }
     let _guard = CaptureGuard;

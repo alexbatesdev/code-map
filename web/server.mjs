@@ -203,6 +203,7 @@ export async function createMegamapHandler({ prefix = '/megamap', projects = [],
         const view = await current.request({ op: 'view', options: { prSide: 'after', prScope: 'all', prSeed: null, direction: 'all', depth: 1 } });
         return { comparison: id, view };
       } catch (error) {
+        if (record.worker) { await record.worker.close(); record.worker = null; }
         if (comparison) await discardWorker(comparison.key);
         if (directory) await rm(directory, { recursive: true, force: true });
         throw error;
@@ -261,9 +262,10 @@ export async function createMegamapHandler({ prefix = '/megamap', projects = [],
     },
     async close() {
       closed = true;
-      await Promise.all([...preparing.values()].map(record => record.worker?.close()));
-      await Promise.allSettled([...preparing.values()].map(record => record.promise));
-      await Promise.all([...workers.values()].map(w => w.close())); workers.clear();
+      const pending = [...preparing.values()];
+      await Promise.all([...pending.map(record => record.worker), ...workers.values()].filter(Boolean).map(w => w.close()));
+      await Promise.allSettled(pending.map(record => record.promise));
+      workers.clear();
       await Promise.all([...comparisons.values()].map(c => rm(c.directory, { recursive: true, force: true }))); comparisons.clear();
     },
   };

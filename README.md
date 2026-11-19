@@ -4,8 +4,8 @@
 
 The browser viewer uses WebGL2 for the treemap and a bounded text overlay for
 readable source. A local Rust worker reuses the desktop scanner, filters,
-relationship graph, evidence handling and syntax colors. Repositories and source
-stay on the local machine; no external service or running Rails app is required.
+relationship graph, evidence handling and syntax colors. Analysis and source browsing run locally. Normal checkout browsing requires no
+external service or running Rails app.
 
 Build the headless workers with Rust, then run with Node.js 18 or newer:
 
@@ -60,6 +60,51 @@ browser source cache to 24 files / 16 MiB, and snapshot uploads to 32 MiB.
 Large indexing runs can take time; status remains responsive. Analysis is still
 incomplete, with inferred links and unresolved/parse/unread counts labeled.
 The native desktop app remains available and builds with the default features.
+
+## Pull request changes and potential impact
+
+Enter a GitHub PR number and click **Load PR**, or open a factory card's
+**changes** link. The service uses the PR's exact merge-base and head commits,
+without changing your local branch, index or uncommitted files. It reads Git blobs
+into private snapshots and never checks out or runs code from the PR. The installed
+`gh` CLI supplies GitHub access; the registered repository's GitHub origin is used.
+A host can explicitly supply `repository: 'owner/name'` on its project configuration.
+
+**Full context** dims unchanged files. **Changed files only** narrows the view to
+edits; **Potential impact** includes possible callers of changed methods. Choose
+one **Changed method** or keep **All changes**, then increase **Depth** to follow
+indirect callers. Impact starts from changed method bodies and signatures, rather
+than every method sharing their file. Edits outside attributable methods use an
+explicitly labeled conservative file-level fallback.
+
+Switch **Before** / **After** without moving the camera or rearranging file boxes.
+Added, modified, deleted and renamed files have badges and outlines; relationship
+colors stay available. The inspector shows changed-line excerpts, possible caller
+chains and added/removed method relationships. Click a chain endpoint to open its
+correct revision and definition. Deleted methods retain their before-side callers.
+The map uses the larger of each file's two source layouts so shorter-side blank
+space and absent-side boxes remain stable.
+
+Potential impact is source analysis and labeled inference, not runtime proof.
+**Analysis coverage** reports parse failures, unresolved calls and omitted data.
+Anonymous/location-based and ambiguous duplicate method identities are omitted
+from relationship-delta matching, with counts, rather than inventing changes from
+line shifts. Unsupported languages still show file/line changes without claiming
+complete caller coverage. No Rails app is booted in PR mode; imported/live app
+facts are unavailable for these immutable revisions.
+
+**Refresh / rescan** in PR mode explicitly reloads current PR metadata into a new
+pinned comparison. **Exit PR** returns to the working checkout. Snapshot sessions
+are local, limited and may expire after other projects/comparisons are opened;
+reload the PR to restore one. Source previews retain the 2 MiB limit, diff excerpts
+are bounded to 400 lines per file, regular snapshots to 8 MiB per file / 512 MiB
+total, and fetched objects to a sampled 512 MiB abort threshold. Symlinks,
+submodules and oversized files have explicit coverage warnings. Failed loads
+leave the working checkout untouched.
+
+Deep links use `?project=ID&pr=NUMBER`, optionally with `&file=relative/path&line=N`.
+Node service regressions run with `node --test web/*.test.mjs`; the Rust release
+suite covers the shared graph, comparison model and protocol.
 
 ## Explorer fork
 

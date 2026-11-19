@@ -74,6 +74,8 @@ pub struct Graph {
     pub parse_errors: usize,
     pub unresolved_sites: usize,
     pub symbols: Vec<SymbolRef>,
+    pub symbol_spans: Vec<Option<(usize, usize)>>,
+    pub symbol_keys: Vec<Option<String>>,
     pub edges: Vec<CallEdge>,
     outgoing: Vec<Vec<usize>>,
     incoming: Vec<Vec<usize>>,
@@ -125,17 +127,21 @@ impl Graph {
     }
 
     pub fn related_filtered(&self, file: &str, direction: Direction, depth: usize, filter: EvidenceFilter) -> Reachability {
-        let mut result = Reachability::default();
+        let mut result = self.related_symbols(self.files.get(file).map_or(&[], Vec::as_slice), direction, depth, filter);
         result.paths.insert(file.to_owned());
-        let Some(roots) = self.files.get(file) else { return result };
+        result
+    }
+
+    pub fn related_symbols(&self, roots: &[usize], direction: Direction, depth: usize, filter: EvidenceFilter) -> Reachability {
+        let mut result = Reachability::default();
+        for &root in roots { if let Some(symbol) = self.symbols.get(root) { result.paths.insert(symbol.file.clone()); } }
         let depth = depth.min(MAX_DEPTH);
         if depth == 0 { return result; }
         let mut visited = vec![false; self.symbols.len()];
         let mut visited_edges = HashSet::new();
         let mut queue = VecDeque::new();
         for &root in roots {
-            visited[root] = true;
-            queue.push_back((root, Vec::<usize>::new()));
+            if root < visited.len() && !visited[root] { visited[root] = true; queue.push_back((root, Vec::<usize>::new())); }
         }
         while let Some((at, chain)) = queue.pop_front() {
             if chain.len() == depth { continue; }
@@ -154,7 +160,7 @@ impl Graph {
                     Direction::Callers => witness.insert(0, edge),
                 }
                 let path = &self.symbols[next].file;
-                if path != file && !result.paths.contains(path) {
+                if !result.paths.contains(path) {
                     result.paths.insert(path.clone());
                     if witness.len() == 1 { result.direct.insert(path.clone()); }
                     else { result.indirect.insert(path.clone()); }
@@ -314,8 +320,62 @@ impl<'a> Builder<'a> {
         let id = self.graph.symbols.len();
         let path = self.sources[file].path.clone();
         self.graph.files.entry(path.clone()).or_default().push(id);
+        let key = (!name.starts_with("<block@") && !name.starts_with("<initializer@") && !name.starts_with("<function@")).then(|| name.clone());
         self.graph.symbols.push(SymbolRef { name, file: path, line });
+        self.graph.symbol_spans.push(None);
+        self.graph.symbol_keys.push(key);
         id
+    }
+
+    fn method_symbol(&mut self, file: usize, name: String, node: Node<'_>) -> usize {
+        let start = node.start_position().row + 1;
+        let key = self.method_key(file, &name, node);
+        let id = self.symbol(file, name, start);
+        self.graph.symbol_keys[id] = key;
+        let end = node.end_position();
+        self.graph.symbol_spans[id] = Some((start, (end.row + usize::from(end.column > 0)).max(start)));
+        id
+    }
+
+    fn method_key(&self, file: usize, name: &str, node: Node<'_>) -> Option<String> {
+        if matches!(node.kind(), "method" | "singleton_method") { return Some(name.into()); }
+        let mut declaration = node;
+        while declaration.parent().is_some_and(|p|p.kind()=="parenthesized_expression") { declaration=declaration.parent().unwrap(); }
+        let default_export=declaration.parent().is_some_and(|p|p.kind()=="export_statement"&&token(p,"default"));
+        if name.starts_with("<function@") && !default_export { return None; }
+        let category=|at:Node<'_>|format!("{}:{}",if token(at,"static"){ "static" }else{ "instance" },if token(at,"get"){ "get" }else if token(at,"set"){ "set" }else{ "method" });
+        let declared_name = |at: Node<'_>| at.child_by_field_name("name").map(|n| self.text(file, n).to_owned())
+            .or_else(|| at.parent().filter(|p| p.kind() == "variable_declarator").and_then(|p| p.child_by_field_name("name")).filter(|n| n.kind() == "identifier").map(|n| self.text(file,n).to_owned()));
+        let mut parts = Vec::new(); let mut parent = node.parent();
+        while let Some(at) = parent {
+            match at.kind() {
+                "class_declaration" | "class" | "abstract_class_declaration" => {
+                    let owner = declared_name(at).or_else(|| at.parent().filter(|p| p.kind() == "export_statement" && token(*p,"default")).map(|_| "default".into()))?;
+                    parts.push(format!("class:{owner}"));
+                }
+                "function_declaration" | "generator_function_declaration" | "function_expression" | "generator_function" | "arrow_function" => parts.push(format!("fn:{}",declared_name(at)?)),
+                "method_definition" => {
+                    let method = at.child_by_field_name("name").and_then(|n| self.property_name(n,file))?;
+                    parts.push(format!("{}:{method}",category(at)));
+                }
+                "object" => {
+                    let owner = at.parent().and_then(|p|match p.kind() {
+                        "variable_declarator" => p.child_by_field_name("name").filter(|n|n.kind()=="identifier").map(|n|self.text(file,n).to_owned()),
+                        "pair" => p.child_by_field_name("key").and_then(|n|self.property_name(n,file)),
+                        "export_statement" if token(p,"default") => Some("default".into()),
+                        _ => None,
+                    })?;
+                    parts.push(format!("object:{owner}"));
+                }
+                "internal_module" | "module" => if let Some(n)=at.child_by_field_name("name") {parts.push(format!("namespace:{}",self.text(file,n)));},
+                _ => {}
+            }
+            parent=at.parent();
+        }
+        parts.reverse();
+        let name=if default_export { "default export" } else { name };
+        parts.push(format!("{}:{name}",if node.kind()=="method_definition" {category(node)}else{"fn".into()}));
+        Some(parts.join("::"))
     }
 
     fn scope(&mut self, parent: Option<usize>, function: bool) -> usize {
@@ -378,7 +438,7 @@ impl<'a> Builder<'a> {
                 let name = node.child_by_field_name("name").map(|n| self.text(file, n).to_owned())
                     .or_else(|| node.parent().filter(|p| p.kind() == "variable_declarator").and_then(|p| p.child_by_field_name("name")).filter(|n| n.kind() == "identifier").map(|n| self.text(file, n).to_owned()))
                     .unwrap_or_else(|| format!("<function@{}>", node.start_position().row + 1));
-                let id = self.symbol(file, name.clone(), node.start_position().row + 1);
+                let id = self.method_symbol(file, name.clone(), node);
                 let value = Binding::Callable(id);
                 self.node_values.insert((file, node.start_byte()), value.clone());
                 if matches!(kind, "function_declaration" | "generator_function_declaration") {
@@ -417,7 +477,7 @@ impl<'a> Builder<'a> {
                 let name_node = node.child_by_field_name("name");
                 let name = name_node.map(|n| self.property_name(n, file).unwrap_or_else(|| self.text(file, n).to_owned())).unwrap_or_else(|| "<method>".into());
                 let singleton = token(node, "static");
-                let id = self.symbol(file, name.clone(), node.start_position().row + 1);
+                let id = self.method_symbol(file, name.clone(), node);
                 let method_class = class.filter(|_| node.parent().is_some_and(|p| p.kind() == "class_body")).map(|(id, _)| (id, singleton));
                 if let Some((class_id, _)) = method_class {
                     if let Some(name) = name_node.and_then(|n| self.property_name(n, file)) {
@@ -785,7 +845,7 @@ impl<'a> Builder<'a> {
                     }
                 }
                 let label = owner.as_ref().map(|owner| format!("{owner}{}{name}", if singleton { "." } else { "#" })).unwrap_or_else(|| name.clone());
-                let id = self.symbol(file, label, node.start_position().row + 1);
+                let id = self.method_symbol(file, label, node);
                 if let Some(owner) = &owner {
                     self.ruby_methods.entry((owner.clone(), singleton, name)).or_default().push(id);
                 } else if !singleton && context.class.is_none() {
@@ -1826,4 +1886,20 @@ mod tests {
         assert_eq!(graph.parse_errors, 0);
         assert!(!graph.edges.iter().any(|edge| edge.caller.name == "start" && edge.callee.name == "hidden"));
     }
+    #[test]
+    fn callers_of_changed_symbol_exclude_an_untouched_sibling_method() {
+        let graph = graph(&[
+            ("service.rb", "class Service\n def self.changed; 1; end\n def self.untouched; 2; end\nend"),
+            ("caller.rb", "class Caller\n def self.run; Service.changed; end\nend"),
+            ("unrelated.rb", "class Unrelated\n def self.run; Service.untouched; end\nend"),
+            ("outer.rb", "class Outer\n def self.run; Caller.run; end\nend"),
+        ]);
+        let root=graph.symbols.iter().position(|s|s.name=="Service.changed").unwrap();
+        let reached=graph.related_symbols(&[root],Direction::Callers,2,EvidenceFilter::default());
+        assert!(reached.direct.contains("caller.rb"));
+        assert!(reached.indirect.contains("outer.rb"));
+        assert!(!reached.paths.contains("unrelated.rb"));
+        assert_eq!(reached.witnesses["outer.rb"].len(),2);
+    }
+
 }

@@ -28,6 +28,18 @@
       <button id="clear-trace" title="Clear the trace root and return to all files.">Clear trace</button>
       <button id="refresh" title="Rescan this project from disk, clear imported evidence and traces, preserve filters and camera, and retry source retrieval.">Refresh / rescan</button>
     </div>
+    <div class="toolbar pr-toolbar">
+      <label title="Inspect a GitHub pull request for the selected registered repository. Its exact merge-base and head are read without switching your checkout.">PR <input id="pr-number" type="number" min="1" step="1" placeholder="Number" aria-label="Pull request number"></label>
+      <button id="pr-load" title="Load this PR's pinned revisions and analyze changed methods and their possible callers.">Load PR</button>
+      <button id="pr-exit" title="Leave the immutable PR snapshots and return to this project's local checkout." hidden>Exit PR</button>
+      <span id="pr-controls" hidden>
+        <label title="Switch source revision while retaining the same file boxes and camera."><select id="pr-side" aria-label="PR revision"><option value="after">After</option><option value="before">Before</option></select></label>
+        <label title="Keep the full codebase as dimmed context, show edited files, or show edited files and possible callers."><select id="pr-scope" aria-label="PR scope"><option value="all">Full context</option><option value="changed">Changed files only</option><option value="impact">Potential impact</option></select></label>
+        <label title="Trace callers of all changed methods, or focus on one changed method. File-level fallbacks are explicitly labeled."><select id="pr-seed" aria-label="Changed method"><option value="">All changes</option></select></label>
+      </span>
+      <span id="pr-summary" role="status"></span>
+    </div>
+    <div id="pr-details" hidden><a id="pr-title" target="_blank" rel="noreferrer"></a><span id="pr-revisions"></span><span class="pr-legend" title="Borders and labels show edits; existing file colors continue to identify relationship destinations.">＋ Added · − Deleted · ~ Modified · → Renamed · ◌ Potential caller</span><details id="pr-warnings" hidden><summary>Analysis coverage</summary><div id="pr-warning-text"></div></details></div>
     <div class="toolbar evidence-bar">
       <label class="upload-label" title="Choose an optional local JSON relationship snapshot. Only this explicitly selected JSON file is sent to the local service; source code stays local.">Snapshot <input id="snapshot" type="file" accept=".json,application/json" aria-label="Load relationship snapshot"></label>
       <button id="static" title="Remove imported or captured evidence and return to static source analysis.">Static only</button>
@@ -51,6 +63,7 @@
     <aside id="inspector" aria-label="Selected file inspector">
       <div class="panel-title">Inspector</div>
       <div id="selection">Select a file in the map or file tree.</div>
+      <div id="pr-inspection" hidden></div>
       <div id="source-status" role="status"></div>
       <div id="source-tools" hidden><label title="Jump to this source line in the treemap.">Line <input id="line" type="number" min="1" value="1" aria-label="Source line"></label><button id="jump-line" title="Zoom to the selected line using the treemap's source layout.">Go</button></div>
       <div id="source-preview" aria-label="Source preview"></div>

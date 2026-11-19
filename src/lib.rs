@@ -10,3 +10,4 @@ pub mod model;
 pub mod scan;
 pub mod web_project;
 pub mod palette;
+pub mod pr_project;
