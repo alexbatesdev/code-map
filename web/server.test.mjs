@@ -136,3 +136,15 @@ test('public page navigation works from an outside link while bootstrap data sta
   assert.equal((await fetch(f.base+'api/config',{headers})).status,403);
   assert.equal((await f.request('api/source?project=p0&node=1',{headers})).status,403);
 });
+
+
+test('PR requests reject invalid numbers and expired or cross-project comparison IDs before starting analysis', async t => {
+  const f = await fixture(t, 2);
+  for (const number of [0, -1, 1.5, '../42', 2147483648, null]) assert.equal((await f.post('api/pr?project=p0', { number })).status, 400);
+  for (const comparison of ['../outside', 'a'.repeat(32)]) {
+    assert.equal((await f.post('api/view?project=p0&comparison=' + encodeURIComponent(comparison), {})).status, 404);
+    assert.equal((await f.request('api/source?project=p1&comparison=' + encodeURIComponent(comparison) + '&node=1')).status, 404);
+  }
+  await assert.rejects(readFile(join(f.projects[0].root, 'spamton-spawns.log')));
+  assert.equal((await f.post('api/view?project=p0', {})).status, 200);
+});
