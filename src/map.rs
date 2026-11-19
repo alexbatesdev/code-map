@@ -257,7 +257,7 @@ impl Map {
 
     pub fn set_evidence_mode(&mut self, mode: usize) {
         self.evidence_mode = mode.min(4);
-        let filter = evidence_filter(self.evidence_mode);
+        let filter = EvidenceFilter::for_mode(self.evidence_mode);
         if self.definition_focus.as_ref().is_some_and(|target| !filter.allows(target.evidence)) { self.definition_focus = None; }
         self.refresh_relationships(ViewUpdate::Preserve);
     }
@@ -356,7 +356,7 @@ impl Map {
                 let direction = if self.relationship_mode == 2 { Direction::Callers } else { Direction::Callees };
                 if self.evidence_mode == 0 && !matches!(self.evidence_input, EvidenceInput::Static) { graph.related(root, direction, self.relationship_depth) }
                 else {
-                    let mut filter = evidence_filter(self.evidence_mode);
+                    let mut filter = EvidenceFilter::for_mode(self.evidence_mode);
                     if matches!(self.evidence_input, EvidenceInput::Static) { filter.loaded = false; filter.observed = false; }
                     graph.related_filtered(root, direction, self.relationship_depth, filter)
                 }
@@ -779,11 +779,8 @@ impl Map {
             return vec4(r, g, b, 1.0);
         }
         match self.color_mode {
-            ColorMode::FileType => match node.kind {
-                Kind::Binary => vec4(0.45, 0.45, 0.47, 1.0),
-                _ => hsv(ext_hue(&node.name), 0.5, 0.8),
-            },
-            _ => heat_color(node.heat),
+            ColorMode::FileType => { let [r,g,b] = crate::palette::file_type_color(&node.name, node.kind == Kind::Binary); vec4(r,g,b,1.0) },
+            _ => { let [r,g,b] = crate::palette::heat_color(node.heat); vec4(r,g,b,1.0) },
         }
     }
 
@@ -1137,10 +1134,6 @@ fn witness_label(chain: &[CallEdge]) -> &'static str {
     }
 }
 
-fn evidence_filter(mode: usize) -> EvidenceFilter {
-    EvidenceFilter { source: mode <= 2, inferred: mode == 0 || mode == 2, loaded: mode == 0 || mode == 3, observed: mode == 0 || mode == 4 }
-}
-
 fn evidence_title(kind: EvidenceKind) -> &'static str {
     match kind {
         EvidenceKind::Source => "Source target",
@@ -1191,45 +1184,6 @@ fn definition_camera(line: R, indent: usize, length: usize, view: DVec2) -> (DVe
     let start = line.x + indent.min(COL_CHARS as usize) as f64 * CHAR_W * line.h;
     let width = length.max(1).min((COL_CHARS as usize).saturating_sub(indent)) as f64 * CHAR_W * line.h;
     (dvec2(start + width.min(view.x / scale * 0.8) * 0.5, line.y + line.h * 0.5), scale)
-}
-
-fn ext_hue(name: &str) -> f32 {
-    let ext = name.rsplit_once('.').map(|(_, e)| e).unwrap_or("");
-    match ext {
-        "rs" => 0.07,
-        "clj" | "cljc" | "edn" => 0.33,
-        "cljs" => 0.45,
-        "js" | "mjs" | "jsx" => 0.14,
-        "ts" | "tsx" => 0.58,
-        "css" | "scss" => 0.78,
-        "html" => 0.02,
-        "json" | "toml" | "yaml" | "yml" => 0.5,
-        "md" | "txt" => 0.62,
-        _ => {
-            let h = ext.bytes().fold(2166136261u32, |h, b| (h ^ b as u32).wrapping_mul(16777619));
-            (h % 1000) as f32 / 1000.0
-        }
-    }
-}
-
-fn heat_color(heat: f32) -> Vec4f {
-    if heat < 0.0 {
-        return vec4(0.30, 0.30, 0.32, 1.0);
-    }
-    let stops = [(0.10, 0.22, 0.60), (0.62, 0.22, 0.62), (0.98, 0.45, 0.18), (1.0, 0.92, 0.35)];
-    let t = heat.clamp(0.0, 1.0) * 3.0;
-    let i = (t.floor() as usize).min(2);
-    let f = t - i as f32;
-    let (a, b) = (stops[i], stops[i + 1]);
-    vec4(a.0 + (b.0 - a.0) * f, a.1 + (b.1 - a.1) * f, a.2 + (b.2 - a.2) * f, 1.0)
-}
-
-fn hsv(h: f32, s: f32, v: f32) -> Vec4f {
-    let f = |n: f32| {
-        let k = (n + h * 6.0) % 6.0;
-        v - v * s * k.min(4.0 - k).clamp(0.0, 1.0)
-    };
-    vec4(f(5.0), f(3.0), f(1.0), 1.0)
 }
 
 fn scale_rgb(c: Vec4f, k: f32) -> Vec4f {
