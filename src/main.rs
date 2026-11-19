@@ -1,14 +1,5 @@
 //! GPU treemap viewer with a native macOS window.
-mod history;
-mod evidence;
-mod evidence_input;
-mod call_colors;
-mod filter;
-mod relationships;
-mod syntax;
-mod source_cache;
-mod model;
-mod scan;
+use megamap::{palette, history, evidence, evidence_input, call_colors, filter, relationships, syntax, source_cache, model, scan};
 #[cfg(target_os="macos")] mod platform;
 #[cfg(target_os="macos")] mod canvas;
 #[cfg(target_os="macos")] mod math;

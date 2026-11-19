@@ -4,6 +4,15 @@ version = "0.1.0"
 edition = "2021"
 default-run = "megamap"
 
+[features]
+default = ["desktop"]
+desktop = []
+
+[[bin]]
+name = "megamap"
+path = "src/main.rs"
+required-features = ["desktop"]
+
 [dependencies]
 tree-sitter = "0.25.10"
 tree-sitter-highlight = "0.25.10"

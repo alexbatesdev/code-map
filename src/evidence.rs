@@ -35,6 +35,10 @@ impl Default for EvidenceFilter {
 }
 
 impl EvidenceFilter {
+    pub fn for_mode(mode: usize) -> Self {
+        Self { source: mode <= 2, inferred: mode == 0 || mode == 2, loaded: mode == 0 || mode == 3, observed: mode == 0 || mode == 4 }
+    }
+
     pub fn allows(self, kind: EvidenceKind) -> bool {
         match kind { EvidenceKind::Source => self.source, EvidenceKind::Inferred => self.inferred, EvidenceKind::Loaded => self.loaded, EvidenceKind::Observed => self.observed }
     }
@@ -249,6 +253,16 @@ fn parse_call(value: &Value, files: &HashMap<&str, usize>) -> Option<ObservedCal
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn viewer_modes_select_the_same_evidence_kinds() {
+        let kinds = [EvidenceKind::Source,EvidenceKind::Inferred,EvidenceKind::Loaded,EvidenceKind::Observed];
+        let expected = [[true,true,true,true],[true,false,false,false],[true,true,false,false],[false,false,true,false],[false,false,false,true]];
+        for (mode, expected) in expected.iter().enumerate() {
+            let filter = EvidenceFilter::for_mode(mode);
+            assert_eq!(kinds.map(|kind| filter.allows(kind)), *expected);
+        }
+    }
 
     #[test]
     fn fingerprints_match_the_export_protocol() {

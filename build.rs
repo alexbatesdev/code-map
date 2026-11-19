@@ -3,6 +3,7 @@ use std::{env, path::PathBuf, process::Command};
 fn main() {
     println!("cargo:rerun-if-changed=native/megamap.m");
     println!("cargo:rerun-if-changed=native/megamap.h");
+    if env::var_os("CARGO_FEATURE_DESKTOP").is_none() { return; }
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") { return; }
     let out = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR"));
     let object = out.join("megamap_native.o");

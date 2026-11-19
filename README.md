@@ -1,5 +1,66 @@
 # megamap
 
+## Web viewer
+
+The browser viewer uses WebGL2 for the treemap and a bounded text overlay for
+readable source. A local Rust worker reuses the desktop scanner, filters,
+relationship graph, evidence handling and syntax colors. Repositories and source
+stay on the local machine; no external service or running Rails app is required.
+
+Build the headless workers with Rust, then run with Node.js 18 or newer:
+
+```sh
+cargo build --release --locked --no-default-features --bin megamap-data --bin megamap-capture
+node web/server.mjs --repo /path/to/project --port 4852
+```
+
+Open `http://127.0.0.1:4852/megamap/`. Use the filesystem sidebar, search,
+filters, history colors and relationship traces as in the desktop viewer.
+Click a colored call in readable map source or the inspector to jump to its
+resolved definition. Depth changes preserve the camera. Every toolbar control
+has hover help; a pulsing Triforce indicates pending work. **Refresh / rescan**
+rebuilds the file list and index, clearing traces and optional evidence while
+preserving filters, camera and the selected path where possible.
+
+**Snapshot** imports an explicitly selected local relationship JSON file.
+**Static only** removes that optional data. Rails capture is disabled by default;
+add `--allow-capture` only when you want **Capture Rails metadata** to run the
+registered repository's development `bin/rails runner`. Failed or unavailable
+captures fall back to source analysis. Use exported snapshots when the app runs
+in a container or another Ruby environment. See the evidence instructions below.
+
+A host such as the software factory can mount the same viewer without a second
+HTTP server:
+
+```js
+import { createMegamapHandler } from './web/server.mjs';
+const megamap = await createMegamapHandler({
+  prefix: '/megamap',
+  projects: [{ id: 'my-repo', label: 'My repository', root: '/trusted/checkout' }],
+  binary: '/absolute/path/to/megamap-data',
+  allowCapture: false,
+});
+// In the existing loopback HTTP request handler:
+if (await megamap.handle(req, res)) return;
+// During host shutdown:
+await megamap.close();
+```
+
+Project roots are registered by the host; browser requests cannot choose an
+arbitrary path. Links can include `?project=my-repo&file=app/models/company.rb&line=42`.
+The host must serve plain HTTP on a loopback address with its actual port in the
+Host header. API requests require same-origin access and the viewer's request
+token. The module starts workers on demand, retains at most four, bounds queued
+jobs, and cancels owned processes when closed. It has no npm dependencies.
+
+Local worker hosting supports macOS and Linux; only macOS has been tested.
+The browser needs WebGL2 for the map; without it, the file tree and source
+inspector remain available. Source previews are limited to 2 MiB per file, the
+browser source cache to 24 files / 16 MiB, and snapshot uploads to 32 MiB.
+Large indexing runs can take time; status remains responsive. Analysis is still
+incomplete, with inferred links and unresolved/parse/unread counts labeled.
+The native desktop app remains available and builds with the default features.
+
 ## Explorer fork
 
 This fork adds file filtering, static call paths, and syntax highlighting to the
@@ -66,11 +127,11 @@ types are not reconstructed. A missing edge
 does not prove that code cannot execute. The status bar reports unresolved sites
 and files rejected for parse errors. TypeScript relative imports and an explicit
 `compilerOptions.baseUrl` in `tsconfig.json` are supported; custom path aliases
-and inherited/commented tsconfig files are not resolved. Reopen the repository
+and inherited/commented tsconfig files are not resolved. Reopen the repository (or use **Refresh / rescan** in the web viewer)
 to rebuild the index after source changes. The index is built only on demand,
 from non-ignored supported source files in the original scan.
 
-The original setup instructions below still apply. Build and test the fork with
+The desktop setup instructions below still apply. Build and test the fork with
 `cargo build --release --bins --locked` and `cargo test --release --locked`.
 
 ## Optional Rails metadata and observed calls
@@ -98,7 +159,7 @@ Load the resulting JSON using **Load snapshot**, or launch with
 viewer are relative to the mapped repository. Snapshots use relative source
 paths and content fingerprints, so matching container/host checkouts work.
 Changed, added, deleted or unavailable Ruby context files invalidate the capture
-and retain source analysis. Reopen the project when files are added or removed.
+and retain source analysis. Reopen the project, or use **Refresh / rescan** in the web viewer, when files are added or removed.
 
 To record a chosen local request or test, explicitly wrap that behavior in an
 already loaded Ruby/Rails process:
@@ -130,14 +191,14 @@ Fly over a codebase as a zoomable GPU treemap. Based on
 
 ## Setup
 
-The viewer requires macOS 11 or newer, Rust and Apple's command-line developer
+The desktop viewer requires macOS 11 or newer, Rust and Apple's command-line developer
 tools (`xcrun clang`). Clone this repository alone; no sibling checkout or
 bundled font/resource directory is required. The build uses the installed Apple
 SDK and compiles the Metal shaders at runtime. No additional graphics crates
 are downloaded.
 
 ```sh
-git clone --branch alex/native-metal https://github.com/alexbatesdev/code-map.git
+git clone --branch alex/web-viewer https://github.com/alexbatesdev/code-map.git
 cd code-map
 cargo build --release --bins --locked
 ```
@@ -188,6 +249,9 @@ names sideways. Large folders draw only rows in the viewport.
 
 | File | What it does |
 | --- | --- |
+| `src/lib.rs`, `src/web_project.rs`, `src/bin/megamap-data.rs` | Shared analysis and headless JSON worker |
+| `web/server.mjs`, `web/worker-host.mjs` | Embeddable loopback service and owned worker lifecycle |
+| `web/viewer.mjs`, `web/renderer.mjs` | Browser controls, virtualized tree and WebGL2 map |
 | `src/main.rs`, `src/ui.rs` | Event loop, custom toolbar controls and inspector |
 | `src/scan.rs` | Reads the project from disk, asks git which files are ignored, summarizes every line |
 | `src/model.rs` | Treemap layout and colors |
@@ -198,7 +262,7 @@ names sideways. Large folders draw only rows in the viewport.
 | `src/file_tree.rs` | Cached filesystem rows, folder expansion and selected-path reveal |
 
 The window currently supports macOS only. The `scan` binary and analysis modules
-remain portable; no Windows, Linux or web UI is provided.
+remain portable; the optional web viewer is described above.
 
 Text is shaped with system fonts and drawn from a bounded GPU glyph atlas.
 Rectangles and glyphs share a batched Metal instance stream. Frames render on
