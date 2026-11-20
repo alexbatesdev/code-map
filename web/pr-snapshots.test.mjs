@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
+import fs from 'node:fs/promises';
+import { syncBuiltinESMExports } from 'node:module';
 import { mkdtemp, mkdir, writeFile, readFile, rm, symlink, access, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -10,10 +12,11 @@ import { prepareComparison, githubRepository } from './pr-snapshots.mjs';
 
 const env = { ...process.env, GIT_AUTHOR_NAME: 'Fixture', GIT_AUTHOR_EMAIL: 'fixture@example.test', GIT_COMMITTER_NAME: 'Fixture', GIT_COMMITTER_EMAIL: 'fixture@example.test' };
 const git = (root, ...args) => execFileSync('git', ['-c', 'core.hooksPath=/dev/null', '-C', root, ...args], { encoding: 'utf8', env }).trim();
-async function fixture(t) {
+async function fixture(t, extraFiles = 0) {
   const directory = await mkdtemp(join(tmpdir(), 'spamton-pr-snapshots-')), root = join(directory, 'repo'); await mkdir(root); git(root, 'init', '-q');
   await writeFile(join(root, 'app.rb'), 'class App\n  def run\n    1\n  end\nend\n');
   await writeFile(join(root, 'old name\tfile.txt'), 'renamed content\n'); await writeFile(join(root, 'removed.rb'), 'class Removed; end\n');
+  for (let i = 0; i < extraFiles; i++) await writeFile(join(root, 'extra-' + i + '.rb'), 'class Extra; ' + Math.floor(i / 2) + '; end\n');
   git(root, 'add', '.'); git(root, 'commit', '-qm', 'Before'); const base = git(root, 'rev-parse', 'HEAD');
   await writeFile(join(root, 'app.rb'), 'class App\n  def run\n    2\n  end\nend\n');
   git(root, 'mv', 'old name\tfile.txt', 'new name\nfile.txt'); git(root, 'rm', '-q', 'removed.rb');
@@ -65,6 +68,51 @@ test('identical pinned blobs share snapshot storage without linking to the worki
   assert.equal(after.dev, before.dev);
   assert.notEqual(after.ino, checkout.ino, 'snapshots must not share writable checkout storage');
   assert.equal(after.mode & 0o777, 0o400);
+});
+
+test('snapshot filesystem work overlaps within four jobs and duplicate blobs wait for the copied file', async t => {
+  const f = await fixture(t, 12), target = join(f.directory, 'snapshot'); let active = 0, maximum = 0;
+  const original = { writeFile: fs.writeFile, link: fs.link, mkdir: fs.mkdir };
+  const owned = path => String(path).startsWith(join(target, 'before')) || String(path).startsWith(join(target, 'after'));
+  const delayed = operation => async (...args) => {
+    if (!owned(args[0]) && !owned(args[1])) return original[operation](...args);
+    active++; maximum = Math.max(maximum, active);
+    try {
+      await new Promise(done => setTimeout(done, operation === 'writeFile' ? 50 : 1));
+      if (operation === 'link') await access(args[0]);
+      return await original[operation](...args);
+    } finally { active--; }
+  };
+  for (const operation of Object.keys(original)) fs[operation] = delayed(operation);
+  syncBuiltinESMExports();
+  try { await prepareComparison({ root: f.root }, 42, target, { loadPr: f.loadPr }); }
+  finally { Object.assign(fs, original); syncBuiltinESMExports(); }
+  assert(maximum > 1, 'snapshot I/O must overlap instead of awaiting every file');
+  assert(maximum <= 4, 'snapshot I/O must remain bounded to four jobs');
+  assert.equal(active, 0);
+  const first = await stat(join(target, 'before', 'extra-0.rb')), duplicate = await stat(join(target, 'before', 'extra-1.rb'));
+  assert.equal(first.ino, duplicate.ino);
+});
+
+test('failed snapshot work settles every started write before returning its original error', async t => {
+  const f = await fixture(t, 12), target = join(f.directory, 'snapshot'), original = fs.writeFile;
+  const failure = new Error('fixture snapshot write failed'); let active = 0, started = 0, completed = 0;
+  fs.writeFile = async (...args) => {
+    if (!String(args[0]).startsWith(join(target, 'before'))) return original(...args);
+    const at = started++; active++;
+    try {
+      await new Promise(done => setTimeout(done, at === 0 ? 15 : 50));
+      if (at === 0) throw failure;
+      return await original(...args);
+    } finally { active--; completed++; }
+  };
+  syncBuiltinESMExports();
+  try {
+    await assert.rejects(prepareComparison({ root: f.root }, 42, target, { loadPr: f.loadPr }), error => error === failure);
+    assert(started > 1, 'failure must occur while another snapshot write is pending');
+    assert.equal(active, 0, 'all pending writes must settle before the snapshot is cleaned up');
+    const settled = completed; await new Promise(done => setTimeout(done, 70)); assert.equal(completed, settled);
+  } finally { fs.writeFile = original; syncBuiltinESMExports(); }
 });
 
 test('resolved PR metadata is validated and reused without another GitHub lookup', async t => {

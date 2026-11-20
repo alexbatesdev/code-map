@@ -113,35 +113,53 @@ async function materialize(repository, files, root, budget, copied, onProgress) 
   child.stderr.resume(); let spawnError; child.once('error', error => { spawnError = error; }); child.stdin.on('error', () => {});
   const exited = new Promise(done => child.once('close', code => done(code)));
   const timer = setTimeout(() => child.kill('SIGKILL'), 120_000); timer.unref();
+  const pending = new Set(); let failure;
   try {
     const reader = new ByteReader(child.stdout);
-    const directories = new Set(); let completed = 0;
+    const directories = new Map(); let completed = 0;
+    const finished = () => { completed++; if (completed % 100 === 0) onProgress(completed, files.length); };
+    const start = work => {
+      const job = work.then(finished).catch(error => { failure ||= error; }).finally(() => pending.delete(job));
+      pending.add(job);
+    };
     onProgress(0, files.length);
     for (const file of files) {
-      if (file.omitted) { completed++; if (completed % 100 === 0) onProgress(completed, files.length); continue; }
+      if (pending.size >= 4) await Promise.race(pending);
+      if (failure) throw failure;
+      if (file.omitted) { finished(); continue; }
       budget.bytes += file.bytes;
       if (budget.bytes > MAX_TOTAL) throw new Error('PR snapshots exceed the 512 MiB total limit');
       const segments = file.path.split('/'); segments.pop();
       const folder = join(root, ...segments);
-      if (segments.length && !directories.has(folder)) { await mkdir(folder, { recursive: true, mode: 0o700 }); directories.add(folder); }
       const destination = join(root, file.path), existing = copied.get(file.oid);
+      let data;
       if (existing) {
         if (existing.bytes !== file.bytes) throw new Error('Git blob size did not match the pinned tree');
-        await link(existing.path, destination);
       } else {
         await new Promise((done, reject) => child.stdin.write(file.oid + '\n', error => error ? reject(error) : done()));
         const [oid, type, size] = (await reader.line()).split(' ');
         if (oid !== file.oid || type !== 'blob' || Number(size) !== file.bytes || file.bytes > MAX_FILE) throw new Error('Git blob did not match the pinned tree');
-        const data = await reader.bytes(file.bytes);
+        data = await reader.bytes(file.bytes);
         if ((await reader.bytes(1))[0] !== 10) throw new Error('Invalid Git blob boundary');
-        await writeFile(destination, data, { flag: 'wx', mode: 0o400 });
-        copied.set(file.oid, { path: destination, bytes: file.bytes });
       }
-      completed++; if (completed % 100 === 0) onProgress(completed, files.length);
+      if (failure) throw failure;
+      const work = (async () => {
+        if (segments.length) {
+          if (!directories.has(folder)) directories.set(folder, mkdir(folder, { recursive: true, mode: 0o700 }));
+          await directories.get(folder);
+        }
+        if (existing) { await existing.ready; await link(existing.path, destination); }
+        else await writeFile(destination, data, { flag: 'wx', mode: 0o400 });
+      })();
+      if (!existing) copied.set(file.oid, { path: destination, bytes: file.bytes, ready: work });
+      start(work);
     }
+    await Promise.all(pending);
+    if (failure) throw failure;
     child.stdin.end(); if (await exited !== 0 || spawnError) throw new Error('Git could not read the pinned source snapshot');
     onProgress(files.length, files.length);
-  } finally { clearTimeout(timer); if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL'); await exited; }
+  } catch (error) { throw failure || error; }
+  finally { clearTimeout(timer); if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL'); await Promise.all(pending); await exited; }
 }
 async function changes(repository, base, head, before, after) {
   const raw = (await git(repository, ['diff', '--no-ext-diff', '--no-textconv', '--name-status', '-z', '--find-renames', '-l2000', base, head, '--'])).toString('utf8').split('\0');
