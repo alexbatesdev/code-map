@@ -13,7 +13,7 @@ async function fixture(t, projectCount = 1) {
   await writeFile(binary, `#!${process.execPath}
 import {createInterface} from 'node:readline';import {appendFileSync} from 'node:fs';import {join} from 'node:path';import {spawn} from 'node:child_process';
 const root=process.argv[process.argv.indexOf('--root')+1];appendFileSync(join(root,'spamton-spawns.log'),process.pid+'\\n');
-createInterface({input:process.stdin}).on('line',async line=>{const r=JSON.parse(line);if(r.options?.crashWithChild){const c=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:r.options.inherit?'inherit':'ignore'});appendFileSync(join(root,'spamton-child.log'),c.pid+'\\n');process.exit(2);}if(r.options?.crash)process.exit(2);if(r.options?.slow)await new Promise(done=>setTimeout(done,100));if(r.options?.child){const c=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'});appendFileSync(join(root,'spamton-child.log'),c.pid+'\\n');}process.stdout.write(JSON.stringify({id:r.id,result:{op:r.op,node:r.node,options:r.options,argv:process.argv.slice(2),pid:process.pid,large:r.options?.large?'x'.repeat(1024*1024):null}})+'\\n');});process.stdin.on('end',()=>process.exit(0));
+createInterface({input:process.stdin}).on('line',async line=>{const r=JSON.parse(line);if(r.options?.crashWithChild){const c=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:r.options.inherit?'inherit':'ignore'});appendFileSync(join(root,'spamton-child.log'),c.pid+'\\n');process.exit(2);}if(r.options?.crash)process.exit(2);if(r.options?.progress){process.stdout.write(JSON.stringify({id:r.id,progress:{phase:'parse',message:'Parsing fixture files',completed:1,total:2,elapsedMs:5}})+'\\n');await new Promise(done=>setTimeout(done,200));}if(r.options?.slow)await new Promise(done=>setTimeout(done,100));if(r.options?.child){const c=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'});appendFileSync(join(root,'spamton-child.log'),c.pid+'\\n');}process.stdout.write(JSON.stringify({id:r.id,result:{op:r.op,node:r.node,options:r.options,argv:process.argv.slice(2),pid:process.pid,large:r.options?.large?'x'.repeat(1024*1024):null}})+'\\n');});process.stdin.on('end',()=>process.exit(0));
 `, { mode: 0o755 });
   const projects = [];
   for (let i = 0; i < projectCount; i++) { const root = join(dir, 'p' + i); await mkdir(root); projects.push({ id: 'p' + i, label: 'Project ' + i, root }); }
@@ -135,4 +135,26 @@ test('public page navigation works from an outside link while bootstrap data sta
   assert.match(page.headers.get('content-security-policy'),/frame-ancestors 'self'/);
   assert.equal((await fetch(f.base+'api/config',{headers})).status,403);
   assert.equal((await f.request('api/source?project=p0&node=1',{headers})).status,403);
+});
+
+
+test('PR requests reject invalid numbers and expired or cross-project comparison IDs before starting analysis', async t => {
+  const f = await fixture(t, 2);
+  for (const number of [0, -1, 1.5, '../42', 2147483648, null]) assert.equal((await f.post('api/pr?project=p0', { number })).status, 400);
+  for (const comparison of ['../outside', 'a'.repeat(32)]) {
+    assert.equal((await f.post('api/view?project=p0&comparison=' + encodeURIComponent(comparison), {})).status, 404);
+    assert.equal((await f.request('api/source?project=p1&comparison=' + encodeURIComponent(comparison) + '&node=1')).status, 404);
+  }
+  await assert.rejects(readFile(join(f.projects[0].root, 'spamton-spawns.log')));
+  assert.equal((await f.post('api/view?project=p0', {})).status, 200);
+});
+
+
+test('progress reports real counters without completing the active operation', async t => {
+  const f=await fixture(t);let settled=false;
+  const pending=f.post('api/view?project=p0',{progress:true}).then(r=>{settled=true;return r;});
+  let observed;
+  for(let i=0;i<100;i++){const value=await(await f.request('api/status?project=p0')).json();if(value.progress){observed=value;break;}await new Promise(done=>setTimeout(done,5));}
+  assert.equal(observed?.loading,true);assert.equal(observed.progress.phase,'parse');assert.equal(observed.progress.completed,1);assert.equal(observed.progress.total,2);assert.equal(settled,false,'progress is not a result');
+  assert.equal((await pending).status,200);assert.equal((await(await f.request('api/status?project=p0')).json()).loading,false);
 });

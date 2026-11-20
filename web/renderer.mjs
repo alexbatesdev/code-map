@@ -3,6 +3,7 @@ const MAX_LINES = 5000;
 const MAX_SOURCE_FILES = 8;
 const clamp = (n, min, max) => Math.max(min, Math.min(max, n));
 const isFolder = n => n.kind === 'dir' || n.kind === 'ghost_dir';
+const changeStyle = {added:['#65d99c','＋'],deleted:['#ee8998','−'],modified:['#e8c46e','~'],renamed:['#7bcbd5','→'],type:['#caa0e9','↔']};
 const rgb = c => `rgb(${c.map(v => Math.round(clamp(v, 0, 1) * 255)).join(',')})`;
 const intersects = (r, w, h) => r[0] < w && r[1] < h && r[0] + r[2] > 0 && r[1] + r[3] > 0;
 
@@ -124,13 +125,14 @@ export class MapRenderer {
   setView(view) {
     if (!view.geometry || !(view.geometry.columnChars > 0) || !(view.geometry.charWidth > 0)) throw new Error('The local service did not provide source geometry. Refresh the project or update the analysis binary.');
     this.view = view;
+    this.prFiles = new Map((view.pr?.files || []).map(file => [file.node, file]));
     this.nodes = view.nodes.filter(n => n.visible && n.rect[2] > 0 && n.rect[3] > 0);
     this.updateInstances();
     this.requestDraw();
   }
 
   clear() {
-    this.view = null; this.nodes = []; this.sources = new Map(); this.links = [];
+    this.view = null; this.prFiles = new Map(); this.nodes = []; this.sources = new Map(); this.links = [];
     this.selected = null; this.targetLine = null; this.needsFit = true;
     this.updateInstances(); this.requestDraw();
   }
@@ -142,7 +144,8 @@ export class MapRenderer {
     const search = Boolean(this.view?.searchActive);
     const depths = new Map();
     this.nodes.forEach((n, i) => {
-      const fade = search && !n.onPath ? .22 : 1;
+      const pr = this.prFiles?.get(n.id);
+      const fade = (search && !n.onPath ? .22 : 1) * (this.view?.pr && !isFolder(n) && pr?.status === 'unchanged' && pr?.impact === 'none' ? .24 : 1);
       const depth = n.parent == null ? 0 : (depths.get(n.parent) || 0) + 1;
       depths.set(n.id, depth);
       const base = n.color || [.25,.3,.35];
@@ -237,6 +240,8 @@ export class MapRenderer {
     this.stats.sourceCandidates = sourcesWanted.length;
     for (const [node, rect] of visible) {
       const source = this.sources.get(node.id);
+      const pr = this.prFiles?.get(node.id);
+      if(pr && !isFolder(node) && (changeStyle[pr.status] || pr.impact === 'caller'))this.drawChangeOutline(rect,pr);
       if (wanted.has(node.id) && source && !source.message) this.drawCode(node, source);
       if (this.stats.labels < MAX_LABELS && rect[2] > 54 && rect[3] > 18 && node.id !== 0) this.drawLabel(node, rect);
       if (node.id === this.selected) {
@@ -247,6 +252,14 @@ export class MapRenderer {
     this.callbacks.onSourcesNeeded?.(sourcesWanted.map(n => n.id));
   }
 
+  drawChangeOutline(rect, file) {
+    const ctx=this.ctx,style=changeStyle[file.status];
+    if(rect[2]<4 || rect[3]<4)return;
+    ctx.save();ctx.strokeStyle=style?.[0]||'#8baee8';ctx.lineWidth=style?1.5:1;
+    if(!style)ctx.setLineDash([3,3]);
+    ctx.strokeRect(rect[0]+.75,rect[1]+.75,Math.max(0,rect[2]-1.5),Math.max(0,rect[3]-1.5));ctx.restore();
+  }
+
   drawLabel(node, rect) {
     const ctx = this.ctx;
     const x = Math.max(rect[0], 0) + 4, y = Math.max(rect[1], 0) + 3;
@@ -254,9 +267,11 @@ export class MapRenderer {
     if (room < 25) return;
     ctx.save(); ctx.beginPath(); ctx.rect(rect[0],rect[1],rect[2],rect[3]); ctx.clip();
     ctx.font = '11px system-ui';
-    const chars = Array.from(node.name);
+    const pr=this.prFiles?.get(node.id),prefix=changeStyle[pr?.status]?.[1]||(pr?.impact==='caller'?'◌':'');
+    const name=prefix ? `${prefix} ${node.name}` : node.name;
+    const chars = Array.from(name);
     const max = Math.max(2, Math.floor(room / 6.2));
-    const label = chars.length > max ? chars.slice(0, max-1).join('') + '…' : node.name;
+    const label = chars.length > max ? chars.slice(0, max-1).join('') + '…' : name;
     ctx.fillStyle = '#080c13dd'; ctx.fillRect(x-2,y-1, Math.min(room,ctx.measureText(label).width+6),15);
     ctx.fillStyle = node.ignored ? '#ccb795' : '#e0e6ef'; ctx.fillText(label, x, y+11);
     ctx.restore(); this.stats.labels++;
@@ -273,12 +288,14 @@ export class MapRenderer {
     const firstRow = clamp(Math.floor(-inner[1] / lh), 0, rows);
     const lastRow = clamp(Math.ceil((this.height - inner[1]) / lh), 0, rows);
     const ctx = this.ctx;
+    const changed = source._changedLines || (source._changedLines = new Set(source.pr?.changedLines || []));
     ctx.save(); ctx.beginPath(); ctx.rect(inner[0], inner[1], inner[2], inner[3]); ctx.clip();
     for (let col=firstCol; col<lastCol; col++) {
       for (let row=firstRow; row<lastRow && this.stats.codeLines < MAX_LINES; row++) {
         const i = col * rows + row;
         if (i >= node.lineCount) break;
         const x = inner[0] + col*cw, y = inner[1] + row*lh;
+        if(changed.has(i+1)){ctx.fillStyle=source.pr.side==='before'?'#d8597048':'#43bb8050';ctx.fillRect(x,y,cw,lh);}
         if (node.id === this.selected && i+1 === this.targetLine) {
           ctx.fillStyle = '#f6c95744'; ctx.fillRect(x,y,cw,lh);
           ctx.strokeStyle = '#edc46a'; ctx.lineWidth = 1; ctx.strokeRect(x,y,cw,lh);
@@ -379,6 +396,8 @@ export class MapRenderer {
         const d=hit.link.definition;
         tooltip.textContent=`${d.name} → ${d.file}:${d.line}\n${hit.link.evidence || 'Source'}${hit.link.reason ? ': '+hit.link.reason : ''}`;
       } else if (node) tooltip.textContent=`${node.path || this.view?.root}\n${isFolder(node) ? `${node.totalFiles} files · ${node.totalLines} lines` : `${node.lineCount} lines`}${node.ignored ? ' · ignored: open to read' : ''}`;
+      const pr=node && this.prFiles?.get(node.id);
+      if(pr && !hit)tooltip.textContent+=`\n${pr.status}${pr.impact==='caller'?` · Potential caller, ${pr.distance} method hops`:''}${pr.status==='renamed'?`\n${pr.oldPath} → ${pr.newPath}`:''}`;
       tooltip.hidden = !node && !hit;
       tooltip.style.left = `${Math.min(x+12,Math.max(8,this.width-300))}px`;
       tooltip.style.top = `${Math.max(4,Math.min(y+15,this.height-75))}px`;
