@@ -1,7 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
-import { mkdtemp, mkdir, writeFile, readFile, rm, symlink, access } from 'node:fs/promises';
+import { execFileSync, spawn } from 'node:child_process';
+import { createInterface } from 'node:readline';
+import { fileURLToPath } from 'node:url';
+import { mkdtemp, mkdir, writeFile, readFile, rm, symlink, access, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { prepareComparison, githubRepository } from './pr-snapshots.mjs';
@@ -51,6 +53,63 @@ test('invalid PR numbers and arbitrary configured repository paths are rejected 
   for (const number of [0, -1, 1.5, '../42', 2147483648]) await assert.rejects(prepareComparison({ root: f.root }, number, join(f.directory, 'bad'), { loadPr }), /positive integer/);
   await assert.rejects(prepareComparison({ root: f.root, repository: '../other' }, 42, join(f.directory, 'bad'), { loadPr }), /Invalid configured/);
   assert.equal(called, false);
+});
+
+test('identical pinned blobs share snapshot storage without linking to the working checkout', async t => {
+  const f = await fixture(t);
+  const comparison = await prepareComparison({ root: f.root }, 42, join(f.directory, 'snapshot'), { loadPr: f.loadPr });
+  const before = await stat(join(comparison.directory, 'before', 'old name\tfile.txt'));
+  const after = await stat(join(comparison.directory, 'after', 'new name\nfile.txt'));
+  const checkout = await stat(join(f.root, 'new name\nfile.txt'));
+  assert.equal(after.ino, before.ino, 'unchanged content must be materialized only once across pinned revisions');
+  assert.equal(after.dev, before.dev);
+  assert.notEqual(after.ino, checkout.ino, 'snapshots must not share writable checkout storage');
+  assert.equal(after.mode & 0o777, 0o400);
+});
+
+test('resolved PR metadata is validated and reused without another GitHub lookup', async t => {
+  const f = await fixture(t); const { resolvePullRequest } = await import('./pr-snapshots.mjs'); let lookups = 0;
+  const progress = [];
+  const resolved = await resolvePullRequest({ root: f.root }, 42, { loadPr: async (...args) => { lookups++; return f.loadPr(...args); }, onProgress: value => progress.push(value) });
+  assert.equal(resolved.repository, 'fixture/project');
+  const comparison = await prepareComparison({ root: f.root }, 42, join(f.directory, 'snapshot'), { resolved, loadPr: async () => { lookups++; throw new Error('metadata was already resolved'); }, onProgress: value => progress.push(value) });
+  assert.equal(lookups, 1);
+  assert.equal(comparison.pr.headSha, f.head);
+  for (const value of progress) { assert(Number.isSafeInteger(value.completed)); assert(Number.isSafeInteger(value.total)); assert(value.completed <= value.total); }
+  assert(progress.some(value => value.phase === 'metadata' && value.completed === value.total));
+  assert(progress.some(value => value.phase === 'after-materialize' && value.completed === value.total));
+  await assert.rejects(prepareComparison({ root: f.root }, 42, join(f.directory, 'bad'), { resolved: { ...resolved, repository: 'other/project' } }), /resolved PR metadata/);
+  await assert.rejects(prepareComparison({ root: f.root }, 43, join(f.directory, 'bad'), { resolved }), /pinned PR metadata/);
+});
+
+test('preparation helper resolves once, then prepares with opt-in progress frames', async t => {
+  const f = await fixture(t), bin = join(f.directory, 'bin'), calls = join(f.directory, 'spamton-gh-calls'); await mkdir(bin);
+  await writeFile(join(bin, 'gh'), `#!${process.execPath}\nimport {appendFileSync} from 'node:fs';appendFileSync(${JSON.stringify(calls)},'call\\n');const path=process.argv[3];if(path==='repos/fixture/project/pulls/42')console.log(JSON.stringify(${JSON.stringify({ number: 42, title: 'Fixture PR', repository: 'fixture/project', baseSha: f.base, headSha: f.head })}));else if(path?.startsWith('repos/fixture/project/compare/'))console.log(${JSON.stringify(f.base)});else process.exit(1);\n`, { mode: 0o755 });
+  for (const progress of [false, true]) {
+    const frames = [], child = spawn(process.execPath, [fileURLToPath(new URL('./pr-prepare.mjs', import.meta.url)), ...(progress ? ['--progress'] : [])], { env: { ...env, PATH: bin + ':' + process.env.PATH }, stdio: ['pipe', 'pipe', 'pipe'] });
+    child.stderr.resume(); const timeout = setTimeout(() => child.kill('SIGKILL'), 15_000);
+    try {
+      await new Promise((done, reject) => {
+        child.once('error', reject); child.once('close', code => code === 0 ? done() : reject(new Error('helper exited with code ' + code)));
+        createInterface({ input: child.stdout }).on('line', line => {
+          try {
+            const frame = JSON.parse(line); frames.push(frame); assert.equal(frame.error, undefined);
+            if (frame.id === 1 && frame.result) child.stdin.write(JSON.stringify({ id: 2, op: 'prepare', project: { root: f.root }, number: 42, directory: join(f.directory, 'helper-' + progress), resolved: frame.result }) + '\n');
+            if (frame.id === 2 && frame.result) child.stdin.end();
+          } catch (error) { reject(error); child.kill('SIGKILL'); }
+        });
+        child.stdin.write(JSON.stringify({ id: 1, op: 'resolve', project: { root: f.root }, number: 42 }) + '\n');
+      });
+    } finally { clearTimeout(timeout); if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL'); }
+    assert.deepEqual(frames.filter(frame => frame.result).map(frame => frame.id), [1, 2]);
+    assert.equal(frames.some(frame => frame.progress), progress);
+    if (progress) {
+      assert(frames.some(frame => frame.id === 1 && frame.progress?.phase === 'metadata'));
+      assert(frames.some(frame => frame.id === 2 && frame.progress?.phase === 'after-materialize'));
+      for (const { progress: value } of frames.filter(frame => frame.progress)) assert(Number.isSafeInteger(value.elapsedMs) && value.elapsedMs >= 0);
+    }
+  }
+  assert.equal((await readFile(calls, 'utf8')).trim().split('\n').length, 4, 'each load resolves PR and merge-base once, then preparation makes no GitHub calls');
 });
 
 test('fetching missing revisions excludes deleted historical blobs', async t => {

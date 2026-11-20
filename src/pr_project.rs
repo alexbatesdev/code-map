@@ -1,6 +1,6 @@
-use crate::{call_colors::{self, CallHighlights}, evidence::EvidenceFilter, filter::Filter, model::{self, Kind, R, Tree}, palette, relationships::{self, CallEdge, Direction, Graph, SourceFile, SymbolRef}, scan::{self, Entry, EntryKind}, source_cache::SourceCache, syntax::HighlightedText};
+use crate::{call_colors::{self, CallHighlights}, evidence::EvidenceFilter, filter::Filter, model::{self, Kind, R, Tree}, palette, relationships::{self, CallEdge, Direction, Graph, SymbolRef}, scan::{self, Entry, EntryKind}, source_cache::SourceCache, syntax::HighlightedText};
 use serde_json::{json, Value};
-use std::{collections::{BTreeMap, BTreeSet, HashMap, HashSet}, fs, io::Read, path::{Component, Path, PathBuf}, sync::Arc};
+use std::{collections::{BTreeMap, BTreeSet, HashMap, HashSet}, fs, io::Read, path::{Component, Path, PathBuf}, sync::Arc, time::Instant};
 
 const MAX_FILE: usize = 8 * 1024 * 1024;
 const MAX_PREVIEW: usize = 2 * 1024 * 1024;
@@ -16,7 +16,7 @@ struct Hunk { old_start: usize, old_count: usize, new_start: usize, new_count: u
 struct Change { status: String, old: Option<String>, new: Option<String>, hunks: Vec<Hunk> }
 struct File { path: String, old: Option<String>, new: Option<String>, status: String, node: usize, before_lines: usize, after_lines: usize, change: Option<usize> }
 struct Seed { id: String, name: String, file: String, before: Vec<usize>, after: Vec<usize>, kind: &'static str, change: &'static str }
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 struct Options { side: bool, scope: String, seed: Option<String>, depth: usize, filter: String, hide_tests: bool, search: String, evidence: String }
 impl Default for Options {
     fn default() -> Self { Self { side:true, scope:"all".into(), seed:None, depth:1, filter:String::new(), hide_tests:false, search:String::new(), evidence:"all".into() } }
@@ -35,16 +35,25 @@ impl Options {
         Ok(out)
     }
     fn evidence_filter(&self)->EvidenceFilter {EvidenceFilter::for_mode(match self.evidence.as_str(){"source"=>1,"static"=>2,"loaded"=>3,"observed"=>4,_=>0})}
+    fn json(&self)->Value {json!({"prSide":if self.side{"after"}else{"before"},"prScope":self.scope,"prSeed":self.seed,"depth":self.depth,"filter":self.filter,"hideTests":self.hide_tests,"search":self.search,"evidence":self.evidence})}
 }
+
+struct Projection { witnesses: HashMap<String,(bool,Vec<CallEdge>)>, changed: HashSet<String>, visible: HashSet<String> }
 
 pub struct ComparisonProject {
     tree: Tree, geometry: Vec<(R,u32,f64)>, before: Side, after: Side, files: Vec<File>, changes: Vec<Change>,
     before_paths: HashMap<String,String>, after_paths: HashMap<String,String>, seeds: Vec<Seed>, pr: Value,
-    warnings: Vec<String>, options: Options, filter: Filter, revision: u64, relationships: Value, highlights: CallHighlights,
+    warnings: Vec<String>, options: Options, projected_options: Option<Options>, filter: Filter, revision: u64, relationships: Value, highlights: CallHighlights,
 }
 
 impl ComparisonProject {
     pub fn new(manifest: &Path, expected_head: &Path) -> Result<Self,String> {
+        Self::new_with_progress(manifest, expected_head, |_| {})
+    }
+    pub fn new_with_progress(manifest: &Path, expected_head: &Path, mut progress: impl FnMut(Value)) -> Result<Self,String> {
+        let started=Instant::now();
+        let mut report=|phase:&str,message:&str,completed:usize,total:usize|progress(json!({"phase":phase,"message":message,"completed":completed,"total":total,"elapsedMs":started.elapsed().as_millis() as u64}));
+        report("manifest","Validating comparison manifest",0,1);
         let parent=manifest.parent().ok_or("comparison manifest needs a parent directory")?.canonicalize().map_err(|_|"comparison directory is unavailable")?;
         let input=read_regular(manifest,MAX_MANIFEST as usize)?;
         let v:Value=serde_json::from_slice(&input).map_err(|_|"comparison manifest must be valid JSON")?;
@@ -53,8 +62,16 @@ impl ComparisonProject {
         let base_root=root("baseRoot")?;let head_root=root("headRoot")?;
         if base_root==head_root || head_root!=expected_head.canonicalize().map_err(|_|"comparison head is unavailable")? {return Err("comparison root does not match the worker root".into());}
         let mut warnings:Vec<String>=v.get("warnings").and_then(Value::as_array).ok_or("comparison warnings must be an array")?.iter().map(|s|s.as_str().map(str::to_owned).ok_or_else(||"comparison warning must be text".to_string())).collect::<Result<_,_>>()?;
-        let before=Side::load(&base_root,v.get("baseFiles").ok_or("baseFiles is required")?,&mut warnings,"before")?;
-        let after=Side::load(&head_root,v.get("headFiles").ok_or("headFiles is required")?,&mut warnings,"after")?;
+        report("manifest","Validated comparison manifest",1,1);
+        let mut before=Side::load(&base_root,v.get("baseFiles").ok_or("baseFiles is required")?,&mut warnings,"before",None,&mut report)?;
+        let mut after=Side::load(&head_root,v.get("headFiles").ok_or("headFiles is required")?,&mut warnings,"after",Some(&before),&mut report)?;
+        let (old_graph,new_graph,stats)=Graph::build_pair(&before.sources(),&after.sources(),before.base_url().as_deref(),after.base_url().as_deref(),&mut |phase,completed,total|{
+            let message=if phase=="parse"{"Parsing both revisions (sharing unchanged files)".to_owned()}else{format!("Building {} revision: {}",if phase.starts_with("before-"){"before"}else{"after"},phase.rsplit('-').next().unwrap_or(phase))};
+            report(phase,&message,completed,total);
+        });
+        report("parse-summary",&format!("Parsed {} source files; reused {} unchanged parses",stats.parsed_files,stats.reused_files),stats.parsed_files,stats.parsed_files);
+        before.graph=old_graph;after.graph=new_graph;
+        report("comparison","Building stable comparison map",0,1);
         let pr=v.get("pr").filter(|v|v.is_object()).ok_or("PR metadata is required")?.clone();
         if pr.get("number").and_then(Value::as_u64).filter(|n|*n>0).is_none(){return Err("PR number must be positive".into())}
         for key in ["title","url","baseSha","headSha","mergeBaseSha"] {string(&pr,key)?;}
@@ -120,23 +137,32 @@ impl ComparisonProject {
         if before.graph.parse_errors>0||after.graph.parse_errors>0 {warnings.push("Files with parse errors have no method graph; their edits remain visible but impact coverage is incomplete".into());}
         warnings.push("Potential impact follows source-resolved and labeled inferred calls; dynamic dispatch, framework scheduling and unexercised runtime behavior may be missing".into());
         if warnings.len()>200 {let omitted=warnings.len()-200;warnings.truncate(200);warnings.push(format!("{omitted} additional coverage warnings omitted"));}
-        let mut project=Self{tree,geometry,before,after,files,changes,before_paths,after_paths,seeds,pr,warnings,options:Options::default(),filter:Filter::default(),revision:0,relationships:Value::Null,highlights:CallHighlights::default()};
+        let mut project=Self{tree,geometry,before,after,files,changes,before_paths,after_paths,seeds,pr,warnings,options:Options::default(),projected_options:None,filter:Filter::default(),revision:0,relationships:Value::Null,highlights:CallHighlights::default()};
+        report("comparison","Building stable comparison map",1,1);
+        report("relationship-delta","Comparing method relationships",0,1);
         project.relationships=project.relationship_delta();
+        report("relationship-delta","Compared method relationships",1,1);
         Ok(project)
     }
     pub fn request(&mut self,request:&Value)->Value {let id=request.get("id").cloned().unwrap_or(Value::Null);match self.execute(request){Ok(result)=>json!({"id":id,"result":result}),Err(error)=>json!({"id":id,"error":error})}}
     fn execute(&mut self,request:&Value)->Result<Value,String>{
         match request.get("op").and_then(Value::as_str) {
+            Some("ready")=>Ok(json!({"ready":true})),
             Some("view")=>{let mut options=Options::parse(request.get("options"))?;
-                if options.seed.as_ref().is_some_and(|s|!self.seeds.iter().any(|seed|&seed.id==s)){return Err("unknown changed method ID".into())}
+                self.validate_options(&options)?;
+                if let Some(previous)=request.get("previousOptions"){self.restore_context(previous)?;}
                 let notice=match Filter::parse(&options.filter){Ok(filter)=>{self.filter=filter;None},Err(error)=>{options.filter=self.options.filter.clone();Some(format!("Invalid filter: {error}. Keeping previous valid filter"))}};
                 self.options=options;self.view(notice)
             },
-            Some("source")=>{let node=request.get("node").and_then(Value::as_u64).and_then(|n|usize::try_from(n).ok()).ok_or("node must be an indexed numeric ID")?;let syntax=request.get("syntax").map(|v|v.as_bool().ok_or("syntax must be boolean")).transpose()?.unwrap_or(true);self.source(node,syntax)},
+            Some("source")=>{let node=request.get("node").and_then(Value::as_u64).and_then(|n|usize::try_from(n).ok()).ok_or("node must be an indexed numeric ID")?;let syntax=request.get("syntax").map(|v|v.as_bool().ok_or("syntax must be boolean")).transpose()?.unwrap_or(true);
+                if let Some(context)=request.get("contextOptions"){self.restore_context(context)?;if self.projected_options.as_ref()!=Some(&self.options){self.prepare_projection();}}
+                self.source(node,syntax)},
             Some("capture"|"evidence"|"expand")=>Err("PR revisions are immutable; app evidence, capture and ignored expansion are unavailable in PR mode".into()),
             _=>Err("unknown operation".into()),
         }
     }
+    fn validate_options(&self,options:&Options)->Result<(),String>{if options.seed.as_ref().is_some_and(|s|!self.seeds.iter().any(|seed|&seed.id==s)){Err("unknown changed method ID".into())}else{Ok(())}}
+    fn restore_context(&mut self,value:&Value)->Result<(),String>{let options=Options::parse(Some(value))?;self.validate_options(&options)?;let filter=Filter::parse(&options.filter).map_err(|error|format!("invalid context filter: {error}"))?;self.options=options;self.filter=filter;Ok(())}
     fn roots(&self,after:bool)->Vec<usize>{self.seeds.iter().filter(|s|self.options.seed.as_ref().is_none_or(|id|&s.id==id)).flat_map(|s|if after {s.after.clone()} else{s.before.clone()}).collect()}
     fn paths(&self,after:bool)->&HashMap<String,String>{if after {&self.after_paths}else{&self.before_paths}}
     fn side(&self,after:bool)->&Side {if after {&self.after}else{&self.before}}
@@ -154,7 +180,7 @@ impl ComparisonProject {
         let removed:Vec<_>=before.iter().filter(|(key,_)|!after.contains_key(*key)).map(|(_,e)|*e).collect();
         json!({"addedCount":added.len(),"removedCount":removed.len(),"uncomparedBeforeCount":self.before.graph.edges.len()-before_edges.len(),"uncomparedAfterCount":self.after.graph.edges.len()-after_edges.len(),"added":added.iter().take(MAX_RELATIONSHIPS).map(|e|self.edge(e,true)).collect::<Vec<_>>(),"removed":removed.iter().take(MAX_RELATIONSHIPS).map(|e|self.edge(e,false)).collect::<Vec<_>>()})
     }
-    fn view(&mut self,notice:Option<String>)->Result<Value,String>{
+    fn prepare_projection(&mut self)->Projection{
         let filter=self.options.evidence_filter();
         let before=self.before.graph.related_symbols(&self.roots(false),Direction::Callers,self.options.depth,filter);
         let after=self.after.graph.related_symbols(&self.roots(true),Direction::Callers,self.options.depth,filter);
@@ -167,6 +193,11 @@ impl ComparisonProject {
         let visible:HashSet<_>=self.tree.nodes.iter().enumerate().filter(|(i,n)|n.is_file()&&self.tree.is_visible(*i)).map(|(_,n)|n.path.clone()).collect();
         let edges:Vec<_>=self.side(self.options.side).graph.edges.iter().filter(|e|filter.allows(e.evidence)).map(|e|self.canonical_edge(e,self.options.side)).collect();
         self.highlights=CallHighlights::new(&edges,&visible);
+        self.projected_options=Some(self.options.clone());
+        Projection{witnesses,changed,visible}
+    }
+    fn view(&mut self,notice:Option<String>)->Result<Value,String>{
+        let Projection{witnesses,changed,visible}=self.prepare_projection();
         let files:Vec<_>=self.files.iter().map(|f|{
             let hit=witnesses.get(&f.path);json!({"node":f.node,"status":f.status,"oldPath":f.old,"newPath":f.new,"beforeLines":f.before_lines,"afterLines":f.after_lines,"impact":if changed.contains(&f.path){"changed"}else if hit.is_some(){"caller"}else{"none"},"distance":if changed.contains(&f.path){Some(0)}else{hit.map(|(_,chain)|chain.len())},"witness":hit.map_or(Vec::new(),|(side,chain)|chain.iter().map(|e|self.edge(e,*side)).collect())})
         }).collect();
@@ -179,7 +210,7 @@ impl ComparisonProject {
         let mut pr=self.pr.clone();let p=pr.as_object_mut().unwrap();
         p.extend(json!({"side":if self.options.side{"after"}else{"before"},"scope":self.options.scope,"seed":self.options.seed,"seeds":seed_json,"files":files,"relationships":self.relationships,"counts":{"changedFiles":changed.iter().filter(|p|visible.contains(*p)).count(),"changedMethods":self.seeds.iter().filter(|s|s.kind=="method"&&visible.contains(&s.file)).count(),"directCallers":witnesses.iter().filter(|(p,(_,chain))|!changed.contains(*p)&&visible.contains(*p)&&chain.len()==1).count(),"indirectCallers":witnesses.iter().filter(|(p,(_,chain))|!changed.contains(*p)&&visible.contains(*p)&&chain.len()>1).count()},"diagnostics":{"before":diagnostics(&self.before.graph),"after":diagnostics(&self.after.graph)},"warnings":self.warnings}).as_object().unwrap().clone());
         self.revision=self.revision.wrapping_add(1);let root=&self.tree.nodes[0];
-        Ok(json!({"revision":self.revision,"root":"PR comparison","nodes":nodes,"geometry":{"columnChars":model::COL_CHARS,"charWidth":model::CHAR_W},"status":notice.unwrap_or_else(||format!("PR #{} · potential caller impact · immutable {} revision",self.pr["number"],if self.options.side{"after"}else{"before"})),"evidenceStatus":"Source analysis and labeled inferences; no app code executed","counts":{"files":root.total_files,"lines":root.total_lines,"nodes":self.tree.nodes.iter().enumerate().filter(|(id,_)|self.tree.is_visible(*id)).count()},"trace":{"root":null},"capabilities":{"capture":false,"maxDepth":relationships::MAX_DEPTH},"pr":pr}))
+        Ok(json!({"revision":self.revision,"root":"PR comparison","nodes":nodes,"contextOptions":self.options.json(),"geometry":{"columnChars":model::COL_CHARS,"charWidth":model::CHAR_W},"status":notice.unwrap_or_else(||format!("PR #{} · potential caller impact · immutable {} revision",self.pr["number"],if self.options.side{"after"}else{"before"})),"evidenceStatus":"Source analysis and labeled inferences; no app code executed","counts":{"files":root.total_files,"lines":root.total_lines,"nodes":self.tree.nodes.iter().enumerate().filter(|(id,_)|self.tree.is_visible(*id)).count()},"trace":{"root":null},"capabilities":{"capture":false,"maxDepth":relationships::MAX_DEPTH},"pr":pr}))
     }
     fn source(&mut self,node:usize,syntax:bool)->Result<Value,String>{
         let file=self.files.iter().find(|f|f.node==node).ok_or("source requires a comparison file ID")?;
@@ -222,9 +253,12 @@ impl ComparisonProject {
 }
 
 impl Side {
-    fn load(root:&Path,files:&Value,warnings:&mut Vec<String>,label:&str)->Result<Self,String>{
+    fn load(root:&Path,files:&Value,warnings:&mut Vec<String>,label:&str,previous:Option<&Side>,progress:&mut impl FnMut(&str,&str,usize,usize))->Result<Self,String>{
         let files=files.as_array().filter(|files|files.len()<=MAX_FILES).ok_or("invalid or excessive snapshot inventory")?;let mut records:BTreeMap<String,SnapshotFile>=BTreeMap::new();let mut total=0usize;
-        for f in files {
+        let scan_phase=format!("{label}-scan");let scan_message=format!("Reading {label} revision files");
+        progress(&scan_phase,&scan_message,0,files.len());
+        for (index,f) in files.iter().enumerate() {
+            if index>0&&index%100==0{progress(&scan_phase,&scan_message,index,files.len());}
             let path=string(f,"path")?;validate_path(path)?;if records.contains_key(path){return Err("duplicate snapshot path".into())}
             let bytes=f.get("bytes").and_then(Value::as_u64).ok_or("snapshot file size must be non-negative")?;
             let omitted=match f.get("omitted"){Some(Value::Null)|None=>None,Some(Value::String(s))=>Some(s.clone()),_=>return Err("omission reason must be text or null".into())};
@@ -233,15 +267,17 @@ impl Side {
                 let mut full=root.to_path_buf();for part in Path::new(path).components(){full.push(part);let meta=fs::symlink_metadata(&full).map_err(|_|"snapshot source is unavailable")?;if meta.file_type().is_symlink(){return Err("snapshot symlink reads are forbidden".into())}}
                 let data=read_regular(&full,MAX_FILE)?;if data.len() as u64!=bytes{return Err("snapshot source size does not match its manifest".into())}
                 total=total.checked_add(data.len()).filter(|n|*n<=512*1024*1024).ok_or("snapshot text exceeds 512 MiB")?;
-                if data.contains(&0){None}else{String::from_utf8(data).ok().map(Arc::new)}
+                if data.contains(&0){None}else{String::from_utf8(data).ok().map(|text|{
+                    if let Some(existing)=previous.and_then(|side|side.files.get(path)).and_then(|file|file.text.as_ref()).filter(|old|old.as_str()==text.as_str()){Arc::clone(existing)}else{Arc::new(text)}
+                })}
             };
             records.insert(path.into(),SnapshotFile{bytes,text,omitted});
         }
-        let sources:Vec<_>=records.iter().filter(|(p,_)|relationships::supports_path(p)).filter_map(|(path,f)|f.text.as_ref().map(|text|SourceFile{path:path.clone(),text:(**text).clone()})).collect();
-        let base_url=records.get("tsconfig.json").and_then(|f|f.text.as_ref()).and_then(|s|serde_json::from_str::<Value>(s).ok()).and_then(|v|v.pointer("/compilerOptions/baseUrl").and_then(Value::as_str).map(str::to_owned));
-        let graph=Graph::build(&sources,base_url.as_deref());
-        Ok(Self{files:records,graph,cache:SourceCache::default()})
+        progress(&scan_phase,&scan_message,files.len(),files.len());
+        Ok(Self{files:records,graph:Graph::default(),cache:SourceCache::default()})
     }
+    fn sources(&self)->Vec<(&str,&str)>{self.files.iter().filter(|(p,_)|relationships::supports_path(p)).filter_map(|(path,f)|f.text.as_ref().map(|text|(path.as_str(),text.as_str()))).collect()}
+    fn base_url(&self)->Option<String>{self.files.get("tsconfig.json").and_then(|f|f.text.as_ref()).and_then(|s|serde_json::from_str::<Value>(s).ok()).and_then(|v|v.pointer("/compilerOptions/baseUrl").and_then(Value::as_str).map(str::to_owned))}
 }
 fn make_seeds(before:&Side,after:&Side,files:&[File],changes:&[Change],warnings:&mut Vec<String>)->Vec<Seed>{
     let mut seeds=Vec::new();
@@ -322,6 +358,58 @@ mod tests {
     fn view(project:&mut ComparisonProject,options:Value)->Value{result(project.request(&json!({"id":1,"op":"view","options":options})))}
     fn file<'a>(view:&'a Value,path:&str)->&'a Value{let node=view["nodes"].as_array().unwrap().iter().find(|n|n["path"]==path).unwrap()["id"].clone();view["pr"]["files"].as_array().unwrap().iter().find(|f|f["node"]==node).unwrap()}
     fn modified(path:&str,old_start:usize,old_count:usize,new_start:usize,new_count:usize)->Value{json!([{"status":"modified","oldPath":path,"newPath":path,"hunks":[{"oldStart":old_start,"oldCount":old_count,"newStart":new_start,"newCount":new_count}]}])}
+
+    #[test]
+    fn shared_index_restores_each_clients_source_and_invalid_filter_history() {
+        let old="class Service\n def self.changed; 1; end\n def self.other; 2; end\nend\n";
+        let new=old.replace("changed; 1","changed; 9");
+        let caller="class Caller; def self.run; Service.changed; end; end\n";
+        let fixture=Fixture::new(&[("service.rb",old),("caller.rb",caller)],&[("service.rb",&new),("caller.rb",caller)],modified("service.rb",2,1,2,1));
+        let mut project=fixture.open().unwrap();let initial=view(&mut project,json!({}));
+        let seed=initial["pr"]["seeds"][0]["id"].clone();let node=file(&initial,"service.rb")["node"].clone();let caller_node=file(&initial,"caller.rb")["node"].clone();
+        let client_a=json!({"prSide":"before","prScope":"impact","prSeed":seed,"depth":2,"filter":"service | caller","hideTests":true,"search":"caller","evidence":"source"});
+        let a=view(&mut project,client_a.clone());
+        let expected=result(project.request(&json!({"op":"source","node":node,"syntax":false})));
+        let expected_links=result(project.request(&json!({"op":"source","node":caller_node,"syntax":false})));
+        let b=view(&mut project,json!({"prSide":"after","filter":"service","evidence":"observed"}));
+        let expected_b=result(project.request(&json!({"op":"source","node":node,"syntax":false})));
+        let expected_b_links=result(project.request(&json!({"op":"source","node":caller_node,"syntax":false})));
+        let actual=result(project.request(&json!({"op":"source","node":node,"syntax":false,"contextOptions":client_a})));
+        assert_eq!(actual,expected,"client A must keep its before source after client B's view");
+        let links=result(project.request(&json!({"op":"source","node":caller_node,"syntax":false,"contextOptions":client_a})));
+        assert_eq!(links,expected_links,"source visibility and call links must use client A's context");
+        assert!(!links["lines"][0]["links"].as_array().unwrap().is_empty());
+        assert_eq!(a["contextOptions"],client_a,"views return their complete normalized context");
+        assert_eq!(b["contextOptions"]["prSide"],"after");
+        assert_eq!(result(project.request(&json!({"op":"source","node":node,"syntax":false,"contextOptions":b["contextOptions"]}))),expected_b);
+        assert_eq!(result(project.request(&json!({"op":"source","node":caller_node,"syntax":false,"contextOptions":b["contextOptions"]}))),expected_b_links);
+        // Another client's valid filter must never become A's invalid-filter fallback.
+        view(&mut project,json!({"filter":"service","evidence":"observed"}));
+        let mut invalid=client_a.clone();invalid["filter"]=json!("|");
+        let restored=result(project.request(&json!({"op":"view","previousOptions":client_a,"options":invalid})));
+        assert_eq!(restored["contextOptions"]["filter"],"service | caller");
+        assert!(restored["nodes"][caller_node.as_u64().unwrap() as usize]["visible"].as_bool().unwrap());
+        let first=result(project.request(&json!({"op":"view","previousOptions":{},"options":{"filter":"|"}})));
+        assert_eq!(first["contextOptions"]["filter"],"");
+    }
+
+    #[test]
+    fn construction_progress_reports_real_bounded_stages_without_changing_results() {
+        let old="class Service; def self.run; 1; end; end\n";let new=old.replace("run; 1","run; 2");
+        let fixture=Fixture::new(&[("service.rb",old)],&[("service.rb",&new)],modified("service.rb",1,1,1,1));
+        let mut ordinary=fixture.open().unwrap();let mut events=Vec::new();
+        let mut reported=ComparisonProject::new_with_progress(&fixture.root.join("comparison.json"),&fixture.root.join("after"),|event|events.push(event)).unwrap();
+        assert_eq!(result(reported.request(&json!({"id":1,"op":"ready"}))),json!({"ready":true}));
+        assert_eq!(view(&mut reported,json!({})),view(&mut ordinary,json!({})));
+        for phase in ["manifest","before-scan","after-scan","parse","before-resolve","before-index","after-resolve","after-index","comparison","relationship-delta"] {
+            let stage:Vec<_>=events.iter().filter(|event|event["phase"]==phase).collect();
+            assert!(stage.len()>=2,"missing progress for {phase}");
+            assert_eq!(stage[0]["completed"],0);
+            let final_event=stage.last().unwrap();assert_eq!(final_event["completed"],final_event["total"]);
+            assert!(stage.windows(2).all(|events|events[0]["completed"].as_u64()<=events[1]["completed"].as_u64()));
+        }
+        assert!(events.windows(2).all(|events|events[0]["elapsedMs"].as_u64()<=events[1]["elapsedMs"].as_u64()));
+    }
 
     #[test]
     fn body_edit_starts_at_its_method_and_keeps_geometry_stable_across_sides_and_depth() {

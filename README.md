@@ -94,7 +94,10 @@ complete caller coverage. No Rails app is booted in PR mode; imported/live app
 facts are unavailable for these immutable revisions.
 
 **Refresh / rescan** in PR mode explicitly reloads current PR metadata into a new
-pinned comparison. **Exit PR** returns to the working checkout. Snapshot sessions
+pinned comparison. Unchanged revisions reuse their completed index; a changed base,
+merge-base or head builds a fresh one. Each tab keeps its own Before/After and filter
+settings. First loads show preparation and analysis progress with elapsed time.
+**Exit PR** returns to the working checkout. Snapshot sessions
 are local, limited and may expire after other projects/comparisons are opened;
 reload the PR to restore one. Source previews retain the 2 MiB limit, diff excerpts
 are bounded to 400 lines per file, regular snapshots to 8 MiB per file / 512 MiB

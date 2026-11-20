@@ -19,8 +19,8 @@ class HttpError extends Error { constructor(status, message) { super(message); t
 
 class Worker {
   constructor(binary, project, allowCapture) {
-    this.queue = []; this.active = null; this.chunks = []; this.bufferedBytes = 0; this.next = 1; this.closed = false; this.lastUsed = Date.now();
-    const command = project.prepare ? [process.execPath, resolve(ROOT, 'pr-prepare.mjs')] : [binary, '--root', project.root, ...(project.manifest ? ['--comparison', project.manifest] : []), ...(!project.manifest && allowCapture ? ['--allow-capture'] : [])];
+    this.queue = []; this.active = null; this.chunks = []; this.bufferedBytes = 0; this.next = 1; this.closed = false; this.lastUsed = Date.now(); this.progress = null;
+    const command = project.prepare ? [process.execPath, resolve(ROOT, 'pr-prepare.mjs'), '--progress'] : [binary, '--root', project.root, ...(project.manifest ? ['--comparison', project.manifest, '--progress'] : []), ...(!project.manifest && allowCapture ? ['--allow-capture'] : [])];
     this.deadline = project.prepare || project.manifest ? 240_000 : REQUEST_TIMEOUT;
     this.child = spawn(process.execPath, [resolve(ROOT, 'worker-host.mjs'), ...command], { stdio: ['pipe', 'pipe', 'pipe'], detached: process.platform !== 'win32' });
     this.exited = new Promise(done => this.child.once('close', done));
@@ -59,6 +59,11 @@ class Worker {
       this.chunks = []; this.bufferedBytes = 0; start = end + 1;
       let value;
       try { value = JSON.parse(line.toString('utf8')); } catch { this.fail(new HttpError(502, 'Invalid analysis response')); this.terminate('SIGKILL'); return; }
+      if (Object.hasOwn(value, 'progress')) {
+        const p = value.progress;
+        if ((value.id != null && value.id !== this.active?.id) || !p || typeof p.phase !== 'string' || typeof p.message !== 'string' || p.phase.length > 128 || p.message.length > 1024 || ['completed', 'total', 'elapsedMs'].some(k => p[k] !== undefined && (!Number.isSafeInteger(p[k]) || p[k] < 0))) { this.fail(new HttpError(502, 'Invalid analysis progress')); this.terminate('SIGKILL'); return; }
+        this.progress = { phase: p.phase, message: p.message, completed: p.completed, total: p.total, elapsedMs: p.elapsedMs }; continue;
+      }
       if (!this.active || value.id !== this.active.id || (!Object.hasOwn(value, 'result') && typeof value.error !== 'string')) { this.fail(new HttpError(502, 'Unexpected analysis response')); this.terminate('SIGKILL'); return; }
       clearTimeout(this.timer);
       const current = this.active; this.active = null;
@@ -144,15 +149,18 @@ export async function createMegamapHandler({ prefix = '/megamap', projects = [],
     registry.set(entry.id, { id: entry.id, label: String(entry.label || entry.id).slice(0, 256), root, ...(entry.repository ? { repository: entry.repository } : {}) });
   }
   const token = randomBytes(32).toString('hex');
-  const workers = new Map(), comparisons = new Map(), preparing = new Map(); let closed = false;
+  const workers = new Map(), indexes = new Map(), comparisons = new Map(), preparing = new Map(); let closed = false;
   let acquisition = Promise.resolve();
-  function worker(project, refresh = false) {
+  function requestWorker(project, payload, refresh = false) {
     const result = acquisition.then(async () => {
+      if (closed) throw new HttpError(503, 'Megamap service is closed');
+      if (project.manifest && !indexes.has(project.key)) throw new HttpError(404, 'PR comparison expired. Load the PR again.');
       if (refresh) { const key = project.key || project.id; const old = workers.get(key); if (old) { await old.close(); workers.delete(key); } }
-      return acquire(project);
+      const current = await acquire(project);
+      return { response: current.request(payload) };
     });
-    acquisition = result.catch(() => {});
-    return result;
+    acquisition = result.then(() => {}, () => {});
+    return result.then(({ response }) => response);
   }
   async function acquire(project) {
     const key = project.key || project.id;
@@ -160,7 +168,7 @@ export async function createMegamapHandler({ prefix = '/megamap', projects = [],
     if (previous && !previous.closed) return previous;
     if (previous) { await previous.close(); workers.delete(key); }
     if (workers.size >= 4) {
-      const idle = [...workers].filter(([, w]) => !w.busy).sort((a, b) => a[1].lastUsed - b[1].lastUsed)[0];
+      const idle = [...workers].filter(([key, w]) => !w.busy && ![...preparing.values()].some(r => r.index?.key === key)).sort((a, b) => a[1].lastUsed - b[1].lastUsed)[0];
       if (!idle) throw new HttpError(503, 'All Megamap analysis slots are busy');
       await discardWorker(idle[0]);
     }
@@ -169,7 +177,9 @@ export async function createMegamapHandler({ prefix = '/megamap', projects = [],
   }
   async function discardWorker(key) {
     const old = workers.get(key); if (old) { await old.close(); workers.delete(key); }
-    for (const [id, comparison] of comparisons) if (comparison.key === key) { comparisons.delete(id); await rm(comparison.directory, { recursive: true, force: true }); }
+    for (const [id, comparison] of comparisons) if (comparison.key === key) comparisons.delete(id);
+    const index = indexes.get(key); indexes.delete(key);
+    if (index) await rm(index.directory, { recursive: true, force: true });
   }
   function resolveComparison(project, id) {
     if (!id) return project;
@@ -177,39 +187,72 @@ export async function createMegamapHandler({ prefix = '/megamap', projects = [],
     if (!/^[a-f0-9]{32}$/.test(id) || !comparison || comparison.projectId !== project.id) throw new HttpError(404, 'PR comparison expired or belongs to another project. Load the PR again.');
     comparison.lastUsed = Date.now(); return comparison;
   }
-  function prepare(project, number) {
+  function decorate(view, session) {
+    if (view.pr) view.pr = { ...view.pr, ...session.pr };
+    return view;
+  }
+  function prepare(project, number, options = {}) {
     if (!Number.isSafeInteger(number) || number < 1 || number > 2147483647) throw new HttpError(400, 'PR number must be a positive integer');
-    if (preparing.has(project.id) || preparing.size >= 2) throw new HttpError(503, 'PR preparation is busy. Retry when the current load finishes.');
-    const record = {}; preparing.set(project.id, record);
-    record.promise = (async () => {
-      let directory, id, comparison;
+    if (!options || typeof options !== 'object' || Array.isArray(options)) throw new HttpError(400, 'PR options must be an object');
+    let record = preparing.get(project.id);
+    if (record && (record.number !== number || record.callers >= 16) || !record && preparing.size >= 2) throw new HttpError(503, 'PR preparation is busy. Retry when the current load finishes.');
+    if (!record) {
+      record = { number, started: Date.now(), callers: 0 }; preparing.set(project.id, record);
+      record.promise = (async () => {
+        let directory, index, created = false;
+        try {
+          if (closed) throw new HttpError(503, 'Megamap service is closed');
+          record.worker = new Worker(binary, { ...project, prepare: true }, false);
+          const configured = { root: project.root, ...(project.repository ? { repository: project.repository } : {}) };
+          const resolved = await record.worker.request({ op: 'resolve', project: configured, number });
+          if (closed) throw new HttpError(503, 'Megamap service is closed');
+          const pr = resolved.pr;
+          if (!pr || pr.number !== number || ![pr.baseSha, pr.mergeBaseSha, pr.headSha].every(sha => typeof sha === 'string' && /^[a-f0-9]{40,64}$/.test(sha))) throw new HttpError(502, 'Invalid PR revision metadata');
+          const key = JSON.stringify([project.id, number, pr.baseSha, pr.mergeBaseSha, pr.headSha]);
+          index = indexes.get(key);
+          if (index && workers.get(key)?.closed !== false) { await discardWorker(key); index = null; }
+          if (!index) {
+            directory = await mkdtemp(resolve(tmpdir(), 'spamton-megamap-pr-'));
+            const result = await record.worker.request({ op: 'prepare', project: configured, number, directory, resolved });
+            if (closed) throw new HttpError(503, 'Megamap service is closed');
+            if (result.directory !== directory || result.manifest !== resolve(directory, 'comparison.json') || result.root !== resolve(directory, 'after')) throw new HttpError(502, 'Invalid PR preparation result');
+            index = { ...project, ...result, projectId: project.id, key }; created = true;
+            indexes.set(key, index); record.index = index;
+            await record.worker.close(); record.worker = null;
+            await requestWorker(index, { op: 'ready' });
+          }
+          record.index = index;
+          return { index, pr };
+        } catch (error) {
+          if (record.worker) { await record.worker.close(); record.worker = null; }
+          if (created) await discardWorker(index.key);
+          else if (directory) await rm(directory, { recursive: true, force: true });
+          throw error;
+        } finally { if (record.worker) { await record.worker.close(); record.worker = null; } }
+      })();
+    }
+    record.callers++;
+    return (async () => {
+      let id;
       try {
-        directory = await mkdtemp(resolve(tmpdir(), 'spamton-megamap-pr-'));
+        const { index, pr } = await record.promise;
         if (closed) throw new HttpError(503, 'Megamap service is closed');
-        record.worker = new Worker(binary, { ...project, prepare: true }, false);
-        const result = await record.worker.request({ op: 'prepare', project: { root: project.root, ...(project.repository ? { repository: project.repository } : {}) }, number, directory });
-        if (closed) throw new HttpError(503, 'Megamap service is closed');
-        if (result.directory !== directory || result.manifest !== resolve(directory, 'comparison.json') || result.root !== resolve(directory, 'after')) throw new HttpError(502, 'Invalid PR preparation result');
-        await record.worker.close(); record.worker = null;
-        if (comparisons.size >= 4) {
-          const idle = [...comparisons.values()].filter(c => !workers.get(c.key)?.busy).sort((a,b) => a.lastUsed - b.lastUsed)[0];
-          if (!idle) throw new HttpError(503, 'All PR comparison slots are busy');
-          await discardWorker(idle.key);
+        while (comparisons.size >= 16) {
+          const idle = [...comparisons].filter(([, c]) => !c.active).sort((a, b) => a[1].lastUsed - b[1].lastUsed)[0];
+          if (!idle) throw new HttpError(503, 'All PR sessions are busy');
+          comparisons.delete(idle[0]);
         }
         id = randomBytes(16).toString('hex');
-        comparison = { ...project, ...result, projectId: project.id, key: `${project.id}:${id}`, lastUsed: Date.now() };
-        comparisons.set(id, comparison);
-        const current = await worker(comparison);
-        const view = await current.request({ op: 'view', options: { prSide: 'after', prScope: 'all', prSeed: null, direction: 'all', depth: 1 } });
-        return { comparison: id, view };
-      } catch (error) {
-        if (record.worker) { await record.worker.close(); record.worker = null; }
-        if (comparison) await discardWorker(comparison.key);
-        if (directory) await rm(directory, { recursive: true, force: true });
-        throw error;
-      } finally { if (record.worker) await record.worker.close(); preparing.delete(project.id); }
+        const session = { ...index, pr, options: {}, lastUsed: Date.now(), active: 1 };
+        comparisons.set(id, session);
+        try {
+          const view = await requestWorker(session, { op: 'view', options, previousOptions: session.options });
+          session.options = view.contextOptions || {};
+          return { comparison: id, view: decorate(view, session) };
+        } finally { session.active--; }
+      } catch (error) { if (id) comparisons.delete(id); throw error; }
+      finally { if (--record.callers === 0 && preparing.get(project.id) === record) preparing.delete(project.id); }
     })();
-    return record.promise;
   }
   return {
     async handle(req, res) {
@@ -237,8 +280,10 @@ export async function createMegamapHandler({ prefix = '/megamap', projects = [],
         if (!project) throw new HttpError(404, 'Unknown configured project');
         const selected = route === 'api/pr' ? project : resolveComparison(project, url.searchParams.get('comparison'));
         if (route === 'api/status' && req.method === 'GET') {
-          const w = workers.get(selected.key || selected.id), loading = Boolean(w?.busy || preparing.has(project.id));
-          await json(res, 200, { loading, message: loading ? (preparing.has(project.id) ? 'Loading pinned PR revisions and analyzing potential impact…' : 'Analyzing repository…') : '', error: w?.error || null }, req); return true;
+          const record = preparing.get(project.id), w = workers.get(selected.key || selected.id), analyzing = record?.index && workers.get(record.index.key);
+          const loading = Boolean(w?.busy || record), progress = analyzing?.progress || record?.worker?.progress || w?.progress;
+          const elapsedMs = record ? Date.now() - record.started : undefined;
+          await json(res, 200, { loading, message: loading ? (progress?.message || (record ? 'Checking pinned PR revisions…' : 'Analyzing repository…')) : '', progress: loading ? progress : null, elapsedMs, error: w?.error || null }, req); return true;
         }
         let payload;
         if (route === 'api/source' && req.method === 'GET') {
@@ -248,7 +293,7 @@ export async function createMegamapHandler({ prefix = '/megamap', projects = [],
         } else {
           if (req.method !== 'POST') throw new HttpError(405, 'Use POST for this operation');
           const value = await body(req);
-          if (route === 'api/pr') { await json(res, 200, await prepare(project, value.number), req); return true; }
+          if (route === 'api/pr') { await json(res, 200, await prepare(project, value.number, value.options), req); return true; }
           if (selected.manifest && route !== 'api/view') throw new HttpError(409, 'PR snapshots are immutable. Reload the PR or exit PR mode to use this control.');
           if (route === 'api/view' || route === 'api/refresh') payload = { op: 'view', options: route === 'api/refresh' ? { ...value, traceRoot: null, direction: 'all', evidence: 'all' } : value };
           else if (route === 'api/expand') payload = { op: 'expand', node: nodeId(value.node) };
@@ -256,7 +301,16 @@ export async function createMegamapHandler({ prefix = '/megamap', projects = [],
           else if (route === 'api/capture') { if (!allowCapture) throw new HttpError(403, 'Rails capture is disabled; import a snapshot instead'); payload = { op: 'capture' }; }
           else throw new HttpError(404, 'Unknown Megamap operation');
         }
-        const current = await worker(selected, route === 'api/refresh'); const result = await current.request(payload); await json(res, 200, result, req);
+        if (selected.manifest) {
+          if (payload.op === 'source') payload.contextOptions = selected.options;
+          else payload.previousOptions = selected.options;
+          selected.active++;
+        }
+        try {
+          const result = await requestWorker(selected, payload, route === 'api/refresh');
+          if (selected.manifest && payload.op === 'view') { selected.options = result.contextOptions || selected.options; decorate(result, selected); }
+          await json(res, 200, result, req);
+        } finally { if (selected.manifest) selected.active--; }
       } catch (error) { await json(res, error.status || 500, { error: error.status ? error.message : 'Megamap service could not complete the request' }, req); }
       return true;
     },
@@ -266,7 +320,7 @@ export async function createMegamapHandler({ prefix = '/megamap', projects = [],
       await Promise.all([...pending.map(record => record.worker), ...workers.values()].filter(Boolean).map(w => w.close()));
       await Promise.allSettled(pending.map(record => record.promise));
       workers.clear();
-      await Promise.all([...comparisons.values()].map(c => rm(c.directory, { recursive: true, force: true }))); comparisons.clear();
+      await Promise.all([...indexes.values()].map(c => rm(c.directory, { recursive: true, force: true }))); indexes.clear(); comparisons.clear();
     },
   };
 }

@@ -45,17 +45,23 @@ impl WorkerProject {
 }
 
 fn run() -> Result<(), String> {
-    let mut args = std::env::args_os().skip(1); let mut root = None; let mut capture = false; let mut comparison = None;
+    let mut args = std::env::args_os().skip(1); let mut root = None; let mut capture = false; let mut comparison = None; let mut progress = false;
     while let Some(arg) = args.next() {
         if arg == "--root" { if root.is_some() { return Err("pass --root once".into()); } root = Some(PathBuf::from(args.next().ok_or("--root needs a path")?)); }
         else if arg == "--comparison" { if comparison.is_some() { return Err("pass --comparison once".into()); } comparison = Some(PathBuf::from(args.next().ok_or("--comparison needs a manifest path")?)); }
         else if arg == "--allow-capture" { capture = true; }
-        else if arg == "--help" { println!("megamap-data --root PATH [--allow-capture] [--comparison MANIFEST]"); return Ok(()); }
+        else if arg == "--progress" { progress = true; }
+        else if arg == "--help" { println!("megamap-data --root PATH [--allow-capture] [--comparison MANIFEST] [--progress]"); return Ok(()); }
         else { return Err("unknown argument; use --root PATH [--allow-capture]".into()); }
     }
     let root = root.ok_or("--root PATH is required")?;
     if comparison.is_some() && capture { return Err("Rails capture is unavailable for immutable PR revisions".into()); }
-    let mut project = if let Some(manifest) = comparison { WorkerProject::Comparison(ComparisonProject::new(&manifest, &root)?) } else { WorkerProject::Ordinary(Project::new(&root, capture)?) };
+    let mut output = io::stdout().lock();
+    let mut progress_error = None;
+    let mut project = if let Some(manifest) = comparison { WorkerProject::Comparison(ComparisonProject::new_with_progress(&manifest, &root, |event| {
+        if progress && progress_error.is_none() { progress_error = write_response(&mut output, json!({"progress":event})).err(); }
+    })?) } else { WorkerProject::Ordinary(Project::new(&root, capture)?) };
+    if let Some(error) = progress_error { return Err(error); }
     struct CaptureGuard;
     impl Drop for CaptureGuard { fn drop(&mut self) { evidence_input::cancel_capture(); } }
     let _guard = CaptureGuard;
@@ -66,7 +72,6 @@ fn run() -> Result<(), String> {
         read_requests(&mut io::stdin().lock(), sender, &reader_queued);
         evidence_input::cancel_capture();
     }).map_err(|_| "stdin monitor could not be started")?;
-    let mut output = io::stdout().lock();
     for frame in receiver {
         queued.fetch_sub(1, Ordering::AcqRel);
         let response = match frame {

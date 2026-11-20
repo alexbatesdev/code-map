@@ -1,6 +1,6 @@
 import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
-import { mkdir, writeFile, realpath, readdir, stat } from 'node:fs/promises';
+import { mkdir, writeFile, realpath, readdir, stat, link } from 'node:fs/promises';
 import { join, isAbsolute } from 'node:path';
 
 const exec = promisify(execFile);
@@ -107,7 +107,7 @@ class ByteReader {
     return Buffer.concat(pieces, length);
   }
 }
-async function materialize(repository, files, root, budget) {
+async function materialize(repository, files, root, budget, copied, onProgress) {
   await mkdir(root, { recursive: true, mode: 0o700 });
   const child = spawn('git', ['-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', '-C', repository, 'cat-file', '--batch'], { env: environment, stdio: ['pipe', 'pipe', 'pipe'] });
   child.stderr.resume(); let spawnError; child.once('error', error => { spawnError = error; }); child.stdin.on('error', () => {});
@@ -115,19 +115,32 @@ async function materialize(repository, files, root, budget) {
   const timer = setTimeout(() => child.kill('SIGKILL'), 120_000); timer.unref();
   try {
     const reader = new ByteReader(child.stdout);
+    const directories = new Set(); let completed = 0;
+    onProgress(0, files.length);
     for (const file of files) {
-      if (file.omitted) continue;
+      if (file.omitted) { completed++; if (completed % 100 === 0) onProgress(completed, files.length); continue; }
       budget.bytes += file.bytes;
       if (budget.bytes > MAX_TOTAL) throw new Error('PR snapshots exceed the 512 MiB total limit');
-      await new Promise((done, reject) => child.stdin.write(file.oid + '\n', error => error ? reject(error) : done()));
-      const [oid, type, size] = (await reader.line()).split(' ');
-      if (oid !== file.oid || type !== 'blob' || Number(size) !== file.bytes || file.bytes > MAX_FILE) throw new Error('Git blob did not match the pinned tree');
-      const data = await reader.bytes(file.bytes);
-      if ((await reader.bytes(1))[0] !== 10) throw new Error('Invalid Git blob boundary');
-      const segments = file.path.split('/'); segments.pop(); if (segments.length) await mkdir(join(root, ...segments), { recursive: true, mode: 0o700 });
-      await writeFile(join(root, file.path), data, { flag: 'wx', mode: 0o400 });
+      const segments = file.path.split('/'); segments.pop();
+      const folder = join(root, ...segments);
+      if (segments.length && !directories.has(folder)) { await mkdir(folder, { recursive: true, mode: 0o700 }); directories.add(folder); }
+      const destination = join(root, file.path), existing = copied.get(file.oid);
+      if (existing) {
+        if (existing.bytes !== file.bytes) throw new Error('Git blob size did not match the pinned tree');
+        await link(existing.path, destination);
+      } else {
+        await new Promise((done, reject) => child.stdin.write(file.oid + '\n', error => error ? reject(error) : done()));
+        const [oid, type, size] = (await reader.line()).split(' ');
+        if (oid !== file.oid || type !== 'blob' || Number(size) !== file.bytes || file.bytes > MAX_FILE) throw new Error('Git blob did not match the pinned tree');
+        const data = await reader.bytes(file.bytes);
+        if ((await reader.bytes(1))[0] !== 10) throw new Error('Invalid Git blob boundary');
+        await writeFile(destination, data, { flag: 'wx', mode: 0o400 });
+        copied.set(file.oid, { path: destination, bytes: file.bytes });
+      }
+      completed++; if (completed % 100 === 0) onProgress(completed, files.length);
     }
     child.stdin.end(); if (await exited !== 0 || spawnError) throw new Error('Git could not read the pinned source snapshot');
+    onProgress(files.length, files.length);
   } finally { clearTimeout(timer); if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL'); await exited; }
 }
 async function changes(repository, base, head, before, after) {
@@ -151,28 +164,55 @@ async function changes(repository, base, head, before, after) {
   return result;
 }
 
-export async function prepareComparison(project, number, directory, { loadPr = githubPr } = {}) {
+function validateNumber(number) {
   if (!Number.isSafeInteger(number) || number < 1 || number > 2147483647) throw new Error('PR number must be a positive integer');
-  const repository = project.repository ? repositoryName(project.repository) : githubRepository((await git(project.root, ['remote', 'get-url', 'origin'])).toString('utf8'));
-  const pr = await loadPr(repository, number);
-  if (pr.number !== number || ![pr.baseSha, pr.headSha, pr.mergeBaseSha].every(value => SHA.test(value))) throw new Error('Invalid pinned PR metadata');
+}
+async function projectRepository(project) {
+  return project.repository ? repositoryName(project.repository) : githubRepository((await git(project.root, ['remote', 'get-url', 'origin'])).toString('utf8'));
+}
+function pinnedPr(pr, number, repository) {
+  if (!pr || pr.number !== number || ![pr.baseSha, pr.headSha, pr.mergeBaseSha].every(value => typeof value === 'string' && SHA.test(value))) throw new Error('Invalid pinned PR metadata');
+  return { number, title: String(pr.title || '').slice(0, 1000), url: `https://github.com/${repository}/pull/${number}`, baseSha: pr.baseSha, headSha: pr.headSha, mergeBaseSha: pr.mergeBaseSha };
+}
+export async function resolvePullRequest(project, number, { loadPr = githubPr, onProgress = () => {} } = {}) {
+  validateNumber(number);
+  onProgress({ phase: 'metadata', message: 'Checking the latest PR revisions…', completed: 0, total: 1 });
+  const repository = await projectRepository(project);
+  const pr = pinnedPr(await loadPr(repository, number), number, repository);
+  onProgress({ phase: 'metadata', message: 'PR revisions pinned', completed: 1, total: 1 });
+  return { repository, pr };
+}
+
+export async function prepareComparison(project, number, directory, { loadPr = githubPr, resolved, onProgress = () => {} } = {}) {
+  validateNumber(number);
+  if (!resolved) resolved = await resolvePullRequest(project, number, { loadPr, onProgress });
+  else if (resolved.repository !== await projectRepository(project)) throw new Error('Invalid resolved PR metadata for this project');
+  const repository = repositoryName(resolved.repository), pr = pinnedPr(resolved.pr, number, repository);
   const bare = join(directory, 'objects.git'); await mkdir(directory, { recursive: true, mode: 0o700 });
   await git(directory, ['init', '--bare', '--quiet', bare]);
   const common = (await git(project.root, ['rev-parse', '--path-format=absolute', '--git-common-dir'])).toString('utf8').trim();
   const objects = await realpath(join(common, 'objects'));
   if (objects.includes('\n') || objects.includes('\r')) throw new Error('Unsupported local Git object path');
   await writeFile(join(bare, 'objects/info/alternates'), objects + '\n');
-  for (const sha of new Set([pr.mergeBaseSha, pr.headSha])) {
+  const revisions = [...new Set([pr.mergeBaseSha, pr.headSha])]; let fetched = 0;
+  onProgress({ phase: 'fetch', message: 'Loading pinned Git objects…', completed: 0, total: revisions.length });
+  for (const sha of revisions) {
     try { await git(bare, ['cat-file', '-e', `${sha}^{commit}`]); }
     catch {
       try { await git(bare, ['-c', 'credential.helper=', '-c', 'credential.https://github.com.helper=!gh auth git-credential', 'fetch', '--depth=1', '--no-tags', '--no-write-fetch-head', `https://github.com/${repository}.git`, sha], { objectDirectory: join(bare, 'objects') }); }
       catch (error) { if (/storage limit/.test(error.message)) throw error; throw new Error('Could not fetch the pinned PR commits. Check local GitHub credentials and retry.'); }
     }
+    onProgress({ phase: 'fetch', message: 'Loading pinned Git objects…', completed: ++fetched, total: revisions.length });
   }
+  onProgress({ phase: 'list', message: 'Reading the pinned file trees…', completed: 0, total: 2 });
   const [baseFiles, headFiles] = await Promise.all([entries(bare, pr.mergeBaseSha), entries(bare, pr.headSha)]);
+  onProgress({ phase: 'list', message: 'Pinned file trees loaded', completed: 2, total: 2 });
+  onProgress({ phase: 'diff', message: 'Comparing changed files…', completed: 0, total: 1 });
   const changed = await changes(bare, pr.mergeBaseSha, pr.headSha, baseFiles, headFiles);
-  const baseRoot = join(directory, 'before'), headRoot = join(directory, 'after'), budget = { bytes: 0 };
-  await materialize(bare, baseFiles, baseRoot, budget); await materialize(bare, headFiles, headRoot, budget);
+  onProgress({ phase: 'diff', message: 'Changed files compared', completed: 1, total: 1 });
+  const baseRoot = join(directory, 'before'), headRoot = join(directory, 'after'), budget = { bytes: 0 }, copied = new Map();
+  await materialize(bare, baseFiles, baseRoot, budget, copied, (completed, total) => onProgress({ phase: 'before-materialize', message: 'Preparing Before source files…', completed, total }));
+  await materialize(bare, headFiles, headRoot, budget, copied, (completed, total) => onProgress({ phase: 'after-materialize', message: 'Preparing After source files…', completed, total }));
   const warnings = [];
   for (const [side, files] of [['Before', baseFiles], ['After', headFiles]]) {
     const omitted = files.filter(file => file.omitted); if (omitted.length) warnings.push(`${side}: ${omitted.length} symlink, submodule or oversized files omitted from source analysis`);

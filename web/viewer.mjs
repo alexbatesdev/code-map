@@ -65,7 +65,13 @@ async function pollStatus() {
   try {
     const result=await request('status',{project,comparison});
     if (gen!==state.projectGeneration || !state.busy) return;
-    if (result.message) $('loading-label').textContent=result.message;
+    if (result.message) {
+      const p=result.progress, count=p?.total ? ` · ${Math.min(p.completed||0,p.total).toLocaleString()}/${p.total.toLocaleString()}` : '';
+      const elapsed=Number.isFinite(result.elapsedMs) ? ` · ${Math.floor(result.elapsedMs/1000)}s` : '';
+      const message=result.message+count+elapsed;
+      $('loading-label').textContent=message;
+      if(state.prPending && !state.error)status(message);
+    }
     if (result.error) status(String(result.error),true);
   } catch { /* The active operation reports service errors. */ }
 }
@@ -220,11 +226,12 @@ function loadPR(number,{preserve=false}={}) {
   status(`Loading PR #${number} at its pinned comparison revisions…`);
   return enqueue(async active=>{
     try{
-      const result=await request('pr',{method:'POST',body:{number},project,comparison:null});
+      const sentEpoch=state.optionsEpoch;
+      const result=await request('pr',{method:'POST',body:{number,options:{...state.options}},project,comparison:null});
       if(active!==state.projectGeneration || gen!==state.projectGeneration)return;
       if(typeof result.comparison!=='string' || !result.view?.pr)throw new Error('The service returned no pinned PR comparison.');
       state.comparison=result.comparison;state.prPending=false;
-      const epoch=state.optionsEpoch,view=await request('view',{method:'POST',body:{...state.options},project,comparison:result.comparison});
+      const epoch=state.optionsEpoch,view=epoch===sentEpoch ? result.view : await request('view',{method:'POST',body:{...state.options},project,comparison:result.comparison});
       if(active!==state.projectGeneration || epoch!==state.optionsEpoch)return;
       applyView(view,epoch);
       if(state.pendingFit){renderer.fit();state.pendingFit=false;}
