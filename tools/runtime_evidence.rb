@@ -303,7 +303,10 @@ module MegamapEvidence
       @calls = calls
       @trace_files = trace_files
       @files = {}
-      @method_count = 0
+      @method_definitions = []
+      @method_indices = {}
+      @method_locations = {}
+      @method_owners = {}.compare_by_identity
     end
 
     def export(output)
@@ -324,13 +327,13 @@ module MegamapEvidence
         location = @sources.location(declaration['file'], declaration['line'])
         next unless location
         entry = location.merge('name' => name, 'ancestors' => mod.ancestors.map { |ancestor| MegamapEvidence.module_name(ancestor) }.compact.take(256),
-                               'active_record' => active_record?(mod), 'attributes' => [], 'associations' => [], 'methods' => [])
+                               'active_record' => active_record?(mod), 'attributes' => [], 'associations' => [], 'method_refs' => [])
         add_file(entry['file'])
         if entry['active_record']
           entry['attributes'] = attempt("Attribute metadata unavailable for #{name}", []) { mod.attribute_names.map(&:to_s).uniq.sort.take(2_000) }
           entry['associations'] = attempt("Association metadata unavailable for #{name}", []) { associations(mod) }
         end
-        entry['methods'] = methods(mod, false) + methods(mod, true)
+        entry['method_refs'] = methods(mod, false) + methods(mod, true)
         classes << entry
       end
       calls = @calls.select do |call|
@@ -348,8 +351,9 @@ module MegamapEvidence
         valid
       end
       @sources.warnings.each { |message| warning(message) }
-      document = { 'version' => 1, 'label' => @label, 'captured_at' => Time.now.utc.iso8601,
-                   'files' => @files.sort.to_h, 'context_files' => context, 'classes' => classes, 'calls' => calls, 'warnings' => @warnings.take(64) }
+      document = { 'version' => 2, 'label' => @label, 'captured_at' => Time.now.utc.iso8601,
+                   'files' => @files.sort.to_h, 'context_files' => context, 'classes' => classes,
+                   'method_definitions' => @method_definitions, 'calls' => calls, 'warnings' => @warnings.take(64) }
       encoded = JSON.generate(document)
       raise ArgumentError, 'Evidence exceeds the 32 MiB export limit' if encoded.bytesize > MAX_JSON_BYTES
       write(output, encoded) if output
@@ -394,21 +398,29 @@ module MegamapEvidence
       names = (receiver.public_instance_methods + receiver.protected_instance_methods + receiver.private_instance_methods).uniq.sort
       entries = []
       names.each do |name|
-        if @method_count >= MAX_METHODS
-          warning('Method export limit reached; metadata is incomplete')
-          break
-        end
         method = receiver.instance_method(name)
         source = method.source_location
         next unless source
-        location = @sources.location(source[0], source[1])
-        owner = MegamapEvidence.owner_name(method.owner)
-        next unless location && owner
+        location = @method_locations.fetch(source) { @method_locations[source] = @sources.location(source[0], source[1]) }
+        next unless location
+        defining_owner = method.owner
+        owner = @method_owners[defining_owner] ||= MegamapEvidence.owner_name(defining_owner)
+        next unless owner
         original_name = method.respond_to?(:original_name) ? method.original_name : method.name
-        entries << location.merge('name' => name.to_s, 'owner' => owner[0], 'singleton' => singleton,
-                                  'definition_name' => "#{owner[0]}#{owner[1]}#{original_name}")
-        add_file(location['file'])
-        @method_count += 1
+        definition_name = "#{owner[0]}#{owner[1]}#{original_name}"
+        key = [definition_name, location['file'], location['line']]
+        index = @method_indices[key]
+        unless index
+          if @method_definitions.length >= MAX_METHODS
+            warning('Method export limit reached; metadata is incomplete')
+            next
+          end
+          index = @method_definitions.length
+          @method_indices[key] = index
+          @method_definitions << location.merge('name' => definition_name)
+          add_file(location['file'])
+        end
+        entries << [name.to_s, singleton, index]
       end
       entries
     rescue StandardError

@@ -1,6 +1,6 @@
 use crate::relationships::{SourceFile, SymbolRef};
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::{collections::{HashMap, HashSet}, sync::Arc};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum EvidenceKind {
@@ -48,7 +48,7 @@ impl EvidenceFilter {
 pub struct LoadedMethod {
     pub name: String,
     pub singleton: bool,
-    pub definition: SymbolRef,
+    pub definition: Arc<SymbolRef>,
 }
 
 #[derive(Clone, Debug)]
@@ -96,7 +96,7 @@ impl Snapshot {
     pub fn parse(text: &str, sources: &[SourceFile]) -> Result<Self, String> {
         if text.len() > 64 * 1024 * 1024 { return Err("Evidence exceeds the 64 MiB limit".into()); }
         let value: Value = serde_json::from_str(text).map_err(|e| format!("Invalid evidence JSON: {e}"))?;
-        if value.get("version").and_then(Value::as_u64) != Some(1) { return Err("Unsupported evidence version (expected 1)".into()); }
+        let version=value.get("version").and_then(Value::as_u64).filter(|v|matches!(v,1|2)).ok_or("Unsupported evidence version (expected 1 or 2)")?;
         let files = value.get("files").and_then(Value::as_object).ok_or("Evidence needs a files fingerprint map")?;
         if files.len() > 200_000 { return Err("Too many evidence files".into()); }
         let mut source_map: HashMap<&str, Option<&str>> = HashMap::new();
@@ -133,13 +133,24 @@ impl Snapshot {
         }
         let current_context: HashSet<_> = sources.iter().filter(|source| source.path.ends_with(".rb")).map(|source| source.path.as_str()).collect();
         if captured_context != current_context { return Err("Evidence Ruby source files changed; recapture it".into()); }
+        let mut definitions=Vec::new();
+        if version==2 {
+            if !value.get("method_definitions").is_some_and(Value::is_array){return Err("Compact evidence needs a method_definitions array".into());}
+            let mut targets=HashSet::new();
+            for definition in array(&value,"method_definitions")? {
+                let parsed=symbol(definition,&validated).filter(|symbol|symbol.name.rsplit_once('#').or_else(||symbol.name.rsplit_once('.')).is_some_and(|(owner,method)|constant(owner)&&method_name(method))).map(Arc::new);
+                if let Some(target)=&parsed {if !targets.insert(Arc::clone(target)){return Err("Duplicate compact evidence method definition".into());}}
+                else {result.warn("Skipped invalid or stale method definition".into());}
+                definitions.push(parsed);
+            }
+        }
         let classes = array(&value, "classes")?;
         let mut names = HashMap::new();
         for class in classes {
             if let Some(name) = class.get("name").and_then(Value::as_str) { *names.entry(name).or_insert(0usize) += 1; }
         }
         for class in classes {
-            let Some(parsed) = parse_class(class, &validated) else { result.warn("Skipped invalid or stale loaded class".into()); continue };
+            let Some(parsed) = parse_class(class, &validated, version, &definitions) else { result.warn("Skipped invalid or stale loaded class".into()); continue };
             if names.get(parsed.name.as_str()) != Some(&1) { result.warn(format!("Conflicting loaded class: {}", parsed.name)); continue; }
             result.classes.push(parsed);
         }
@@ -205,7 +216,7 @@ fn symbol(value: &Value, files: &HashMap<&str, usize>) -> Option<SymbolRef> {
     Some(SymbolRef { name, file, line })
 }
 
-fn parse_class(value: &Value, files: &HashMap<&str, usize>) -> Option<LoadedClass> {
+fn parse_class(value: &Value, files: &HashMap<&str, usize>, version:u64, definitions:&[Option<Arc<SymbolRef>>]) -> Option<LoadedClass> {
     let class_name = name(value, "name").filter(|name| constant(name))?;
     let (file, line) = location(value, files)?;
     let ancestors: Vec<String> = array(value, "ancestors").ok()?.iter().map(|v| v.as_str().filter(|s| constant(s)).map(str::to_owned)).collect::<Option<_>>()?;
@@ -223,6 +234,19 @@ fn parse_class(value: &Value, files: &HashMap<&str, usize>) -> Option<LoadedClas
     }
     let mut methods = Vec::new();
     let mut method_names = HashSet::new();
+    if version==2 {
+        if value.get("methods").is_some() || !value.get("method_refs").is_some_and(Value::is_array){return None;}
+        for reference in array(value,"method_refs").ok()? {
+            let tuple=reference.as_array().filter(|tuple|tuple.len()==3)?;
+            let method=tuple[0].as_str().filter(|method|method_name(method))?.to_owned();
+            let singleton=tuple[1].as_bool()?;
+            if !method_names.insert((singleton,method.clone())){return None;}
+            let index=usize::try_from(tuple[2].as_u64()?).ok()?;
+            let definition=Arc::clone(definitions.get(index)?.as_ref()?);
+            methods.push(LoadedMethod{name:method,singleton,definition});
+        }
+    } else {
+        if value.get("method_refs").is_some(){return None;}
     for method in array(value, "methods").ok()? {
         let method_name = name(method, "name").filter(|name| method_name(name))?;
         let owner = name(method, "owner").filter(|owner| constant(owner))?;
@@ -234,7 +258,8 @@ fn parse_class(value: &Value, files: &HashMap<&str, usize>) -> Option<LoadedClas
             None => format!("{owner}{}{method_name}", if singleton { "." } else { "#" }),
         };
         if !definition_name.starts_with(&format!("{owner}#")) && !definition_name.starts_with(&format!("{owner}.")) { return None; }
-        methods.push(LoadedMethod { name: method_name, singleton, definition: SymbolRef { name: definition_name, file, line } });
+        methods.push(LoadedMethod { name: method_name, singleton, definition: Arc::new(SymbolRef { name: definition_name, file, line }) });
+    }
     }
     Some(LoadedClass { name: class_name, file, line, active_record, attributes, associations, methods })
 }
@@ -253,6 +278,75 @@ fn parse_call(value: &Value, files: &HashMap<&str, usize>) -> Option<ObservedCal
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn compact_fixture() -> (Vec<SourceFile>, Value, Value) {
+        let sources=vec![SourceFile{path:"a.rb".into(),text:"module Shared\n def run; end\nend\nclass A; end\nclass B; end\n".into()}];
+        let target=serde_json::json!({"name":"Shared#run","file":"a.rb","line":2});
+        let class=|name:&str,line:usize,methods:Value|serde_json::json!({"name":name,"file":"a.rb","line":line,"methods":methods});
+        let method=|name:&str,singleton:bool|serde_json::json!({"name":name,"singleton":singleton,"owner":"Shared","definition_name":"Shared#run","file":"a.rb","line":2});
+        let legacy=serde_json::json!({"version":1,"files":{"a.rb":fingerprint(&sources[0].text)},"context_files":["a.rb"],"classes":[class("A",4,serde_json::json!([method("run",false),method("again",false),method("run",true)])),class("B",5,serde_json::json!([method("run",false)]))]});
+        let mut compact=legacy.clone();compact["version"]=serde_json::json!(2);compact["method_definitions"]=serde_json::json!([target]);
+        for(class,refs)in compact["classes"].as_array_mut().unwrap().iter_mut().zip([serde_json::json!([["run",false,0],["again",false,0],["run",true,0]]),serde_json::json!([["run",false,0]])]){class.as_object_mut().unwrap().remove("methods");class["method_refs"]=refs;}
+        (sources,legacy,compact)
+    }
+
+    #[test]
+    fn compact_methods_preserve_legacy_alias_and_receiver_side_bindings() {
+        let(sources,legacy,compact)=compact_fixture();
+        let old=Snapshot::parse(&legacy.to_string(),&sources).unwrap();
+        let new=Snapshot::parse(&compact.to_string(),&sources).unwrap();
+        assert_eq!(old.classes.len(),new.classes.len());assert!(new.warnings.is_empty());
+        for(a,b)in old.classes.iter().zip(&new.classes){
+            assert_eq!(a.name,b.name);assert_eq!(a.methods.len(),b.methods.len());
+            for(a,b)in a.methods.iter().zip(&b.methods){assert_eq!(a.name,b.name);assert_eq!(a.singleton,b.singleton);assert_eq!(a.definition,b.definition);}
+        }
+    }
+
+    #[test]
+    fn compact_references_share_definition_allocations_and_reject_ambiguous_tables() {
+        let(sources,_,compact)=compact_fixture();let snapshot=Snapshot::parse(&compact.to_string(),&sources).unwrap();
+        let first=&snapshot.classes[0].methods[0].definition;
+        for class in &snapshot.classes{for method in &class.methods{assert!(Arc::ptr_eq(first,&method.definition));}}
+        let mut unsupported=compact.clone();unsupported["version"]=serde_json::json!(3);assert!(Snapshot::parse(&unsupported.to_string(),&sources).unwrap_err().contains("Unsupported evidence version"));
+        let mut duplicate=compact.clone();let target=duplicate["method_definitions"][0].clone();duplicate["method_definitions"].as_array_mut().unwrap().push(target);
+        assert!(Snapshot::parse(&duplicate.to_string(),&sources).unwrap_err().contains("Duplicate"));
+        for invalid in [serde_json::json!({"name":"run","file":"a.rb","line":2}),serde_json::json!({"name":"<module>","file":"a.rb","line":2}),serde_json::json!({"name":"Shared#run","file":"a.rb","line":99})]{
+            let mut bad=compact.clone();bad["method_definitions"][0]=invalid;let snapshot=Snapshot::parse(&bad.to_string(),&sources).unwrap();assert!(snapshot.classes.is_empty());assert!(!snapshot.warnings.is_empty());
+        }
+        let mut mixed=compact.clone();mixed["classes"][0]["methods"]=serde_json::json!([]);let snapshot=Snapshot::parse(&mixed.to_string(),&sources).unwrap();assert_eq!(snapshot.classes.len(),1);assert_eq!(snapshot.classes[0].name,"B");
+    }
+
+    #[test]
+    fn compact_and_legacy_snapshots_produce_identical_loaded_relationships() {
+        use crate::relationships::Graph;
+        let sources=vec![SourceFile{path:"extra.rb".into(),text:"module Extra; def run; end; alias another run; end".into()},SourceFile{path:"worker.rb".into(),text:"class Worker; extend Extra; end".into()},SourceFile{path:"entry.rb".into(),text:"class Entry; def self.perform; Worker.another; end; end".into()}];
+        let files:serde_json::Map<String,Value>=sources.iter().map(|source|(source.path.clone(),serde_json::json!(fingerprint(&source.text)))).collect();
+        let legacy=serde_json::json!({"version":1,"files":files,"context_files":["extra.rb","worker.rb","entry.rb"],"classes":[{"name":"Worker","file":"worker.rb","line":1,"methods":[{"name":"another","singleton":true,"owner":"Extra","definition_name":"Extra#run","file":"extra.rb","line":1}]}]});
+        let mut compact=legacy.clone();compact["version"]=serde_json::json!(2);compact["method_definitions"]=serde_json::json!([{"name":"Extra#run","file":"extra.rb","line":1}]);compact["classes"][0].as_object_mut().unwrap().remove("methods");compact["classes"][0]["method_refs"]=serde_json::json!([["another",true,0]]);
+        let old=Snapshot::parse(&legacy.to_string(),&sources).unwrap();let new=Snapshot::parse(&compact.to_string(),&sources).unwrap();
+        let a=Graph::build_with_snapshot(&sources,None,Some(&old));let b=Graph::build_with_snapshot(&sources,None,Some(&new));
+        assert_eq!(a.symbols,b.symbols);assert_eq!(a.edges,b.edges);assert_eq!(a.unresolved_sites,b.unresolved_sites);assert!(b.edges.iter().any(|edge|edge.evidence==EvidenceKind::Loaded && edge.callee.name=="Extra#run"));
+    }
+
+    #[test]
+    fn compact_bad_references_never_retarget_independent_valid_classes() {
+        let(sources,_,original)=compact_fixture();
+        for bad in [serde_json::json!(["run",false,-1]),serde_json::json!(["run",false,1]),serde_json::json!(["run",false,1.5]),serde_json::json!(["run",false,"0"]),serde_json::json!(["run",0,0]),serde_json::json!(["bad name",false,0]),serde_json::json!(["run",false]),serde_json::json!(["run",false,0,"extra"])]{
+            let mut value=original.clone();value["classes"][0]["method_refs"]=serde_json::json!([bad]);
+            let snapshot=Snapshot::parse(&value.to_string(),&sources).unwrap();
+            assert_eq!(snapshot.classes.len(),1,"{value}");assert_eq!(snapshot.classes[0].name,"B");assert_eq!(snapshot.classes[0].methods[0].definition.name,"Shared#run");assert!(!snapshot.warnings.is_empty());
+        }
+        for bad in [serde_json::json!([["run",false,0],["run",false,0]]),serde_json::json!({})]{
+            let mut value=original.clone();value["classes"][0]["method_refs"]=bad;let snapshot=Snapshot::parse(&value.to_string(),&sources).unwrap();assert_eq!(snapshot.classes.len(),1);assert_eq!(snapshot.classes[0].name,"B");
+        }
+    }
+
+    #[test]
+    fn compact_invalid_definition_slots_cannot_shift_reference_indices() {
+        let(sources,_,mut compact)=compact_fixture();let target=compact["method_definitions"][0].clone();
+        compact["method_definitions"]=serde_json::json!([{"name":"Shared#bad","file":"../a.rb","line":2},target]);compact["classes"][1]["method_refs"]=serde_json::json!([["run",false,1]]);
+        let snapshot=Snapshot::parse(&compact.to_string(),&sources).unwrap();assert_eq!(snapshot.classes.len(),1);assert_eq!(snapshot.classes[0].name,"B");assert_eq!(snapshot.classes[0].methods[0].definition.name,"Shared#run");
+    }
 
     #[test]
     fn viewer_modes_select_the_same_evidence_kinds() {

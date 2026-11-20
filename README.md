@@ -206,6 +206,12 @@ Load the resulting JSON using **Load snapshot**, or launch with
 `--evidence=/absolute/path/to/snapshot.json`. Relative snapshot paths in the
 viewer are relative to the mapped repository. Snapshots use relative source
 paths and content fingerprints, so matching container/host checkouts work.
+New captures share method definitions across compact per-class lookup references.
+Inherited methods, aliases and instance/class lookup retain their recorded targets;
+the 50,000-method budget counts unique definitions. The 32 MiB export and 45-second
+automatic-capture limits remain unchanged. The viewer accepts both the new version 2
+snapshots and existing version 1 snapshots; older viewers need updating for version 2.
+
 Changed, added, deleted or unavailable Ruby context files invalidate the capture
 and retain source analysis. Reopen the project, or use **Refresh / rescan** in the web viewer, when files are added or removed.
 

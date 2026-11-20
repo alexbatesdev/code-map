@@ -29,6 +29,167 @@ class RuntimeEvidenceTest < Minitest::Test
     Object.const_get(@namespace).const_get(name)
   end
 
+  def methods(document, entry)
+    entry.fetch('method_refs').map do |name, singleton, index|
+      definition = document.fetch('method_definitions').fetch(index)
+      definition_name = definition.fetch('name')
+      owner = definition_name.rpartition(/[.#]/).first
+      definition.merge('name' => name, 'singleton' => singleton, 'owner' => owner, 'definition_name' => definition_name)
+    end
+  end
+
+  def with_owner_counts
+    original = MegamapEvidence.method(:owner_name)
+    owners = Hash.new(0).compare_by_identity
+    MegamapEvidence.define_singleton_method(:owner_name) { |owner| owners[owner] += 1; original.call(owner) }
+    yield owners
+  ensure
+    MegamapEvidence.define_singleton_method(:owner_name, original)
+  end
+
+  def with_limit(name, value)
+    previous = MegamapEvidence.const_get(name)
+    MegamapEvidence.send(:remove_const, name)
+    MegamapEvidence.const_set(name, value)
+    yield
+  ensure
+    MegamapEvidence.send(:remove_const, name)
+    MegamapEvidence.const_set(name, previous)
+  end
+
+  def test_inherited_aliases_share_one_definition_without_losing_receiver_bindings
+    source('shared.rb', "module Shared\n def run; :ok; end\n alias another run\nend\nclass First\n include Shared\nend\nclass Last\n extend Shared\nend")
+    document = MegamapEvidence.snapshot(root: @root)
+    assert_equal 2, document.fetch('version')
+    definitions = document.fetch('method_definitions')
+    target = definitions.index { |definition| definition['name'] == "#{@namespace}::Shared#run" }
+    refute_nil target
+    assert_equal 1, definitions.count { |definition| definition['name'] == "#{@namespace}::Shared#run" }
+    first = document.fetch('classes').find { |entry| entry['name'] == "#{@namespace}::First" }
+    last = document.fetch('classes').find { |entry| entry['name'] == "#{@namespace}::Last" }
+    assert_includes first.fetch('method_refs'), ['run', false, target]
+    assert_includes first.fetch('method_refs'), ['another', false, target]
+    assert_includes last.fetch('method_refs'), ['run', true, target]
+    assert_includes last.fetch('method_refs'), ['another', true, target]
+    refute first.key?('methods')
+    assert_equal ['file', 'line', 'name'], definitions.fetch(target).keys.sort
+    assert_equal 'shared.rb', definitions.fetch(target).fetch('file')
+    assert_equal 3, definitions.fetch(target).fetch('line')
+  end
+
+  def test_unique_definition_limit_still_allows_later_classes_to_reference_existing_targets
+    source('classes.rb', "class ABase\n def shared; :ok; end\nend\nclass BFirst < ABase\n def extra; :extra; end\nend\nclass ZLast < ABase; end")
+    document = with_limit(:MAX_METHODS, 1) { MegamapEvidence.snapshot(root: @root) }
+    assert_equal 2, document.fetch('version')
+    definitions = document.fetch('method_definitions')
+    assert_equal 1, definitions.length
+    assert_equal "#{@namespace}::ABase#shared", definitions.first.fetch('name')
+    first = document.fetch('classes').find { |entry| entry['name'] == "#{@namespace}::BFirst" }
+    last = document.fetch('classes').find { |entry| entry['name'] == "#{@namespace}::ZLast" }
+    assert_includes first.fetch('method_refs'), ['shared', false, 0]
+    assert_includes last.fetch('method_refs'), ['shared', false, 0]
+    refute first.fetch('method_refs').any? { |name, _singleton, _target| name == 'extra' }
+    assert document.fetch('warnings').any? { |warning| warning.include?('Method export limit') }
+  end
+
+  def test_prepended_and_generated_targets_keep_the_effective_definition_and_side
+    source('company.rb', "module Included\n def run; :included; end\nend\nmodule Prepended\n def run; :prepended; end\nend\nclass Company\n include Included\n prepend Prepended\n [:first, :second].each { |name| define_method(name) { :generated } }\n define_singleton_method(:build) { :built }\nend")
+    document = MegamapEvidence.snapshot(root: @root)
+    company = document.fetch('classes').find { |entry| entry['name'] == "#{@namespace}::Company" }
+    loaded = methods(document, company)
+    assert_equal "#{@namespace}::Prepended#run", loaded.find { |method| method['name'] == 'run' }.fetch('definition_name')
+    first = loaded.find { |method| method['name'] == 'first' }
+    second = loaded.find { |method| method['name'] == 'second' }
+    assert_equal first.fetch('line'), second.fetch('line')
+    assert_equal "#{@namespace}::Company#first", first.fetch('definition_name')
+    assert_equal "#{@namespace}::Company#second", second.fetch('definition_name')
+    build = loaded.find { |method| method['name'] == 'build' }
+    assert_equal true, build.fetch('singleton')
+    assert_equal "#{@namespace}::Company.build", build.fetch('definition_name')
+  end
+
+  def test_deduplicated_export_still_enforces_the_existing_byte_budget
+    source('company.rb', "class Company\n def run; :ok; end\nend")
+    error = with_limit(:MAX_JSON_BYTES, 16) do
+      assert_raises(ArgumentError) { MegamapEvidence.snapshot(root: @root, output: @output) }
+    end
+    assert_match(/Evidence exceeds the .* export limit/, error.message)
+    refute File.exist?(@output)
+  end
+
+  def test_inherited_bindings_validate_shared_source_and_owner_metadata_once_per_export
+    path = source('shared.rb', "module Shared\n def run; :ok; end\nend\nclass First\n include Shared\nend\nclass Last\n extend Shared\nend")
+    exporter = MegamapEvidence::Exporter.new(@root, 'shared reflection')
+    sources = exporter.instance_variable_get(:@sources)
+    original_location = sources.method(:location)
+    locations = Hash.new(0)
+    sources.define_singleton_method(:location) do |file, line|
+      locations[[file, line]] += 1
+      original_location.call(file, line)
+    end
+    owners = nil
+    document = with_owner_counts { |counts| owners = counts; exporter.export(nil) }
+    assert_equal 1, locations[[path, 3]], 'an inherited definition location is validated once, not for each receiving class'
+    assert_equal 1, owners[constant('Shared')], 'actual defining module metadata is shared across receiver bindings'
+    first = document.fetch('classes').find { |entry| entry['name'] == "#{@namespace}::First" }
+    last = document.fetch('classes').find { |entry| entry['name'] == "#{@namespace}::Last" }
+    assert_equal "#{@namespace}::Shared#run", methods(document, first).find { |method| method['name'] == 'run' }.fetch('definition_name')
+    assert_equal "#{@namespace}::Shared#run", methods(document, last).find { |method| method['name'] == 'run' }.fetch('definition_name')
+  end
+
+  def test_rejected_sources_are_cached_and_anonymous_owner_lookups_remain_retryable
+    path = source('shared.rb', "class First; end\nclass Last; end")
+    foreign_directory = Dir.mktmpdir('spamton-foreign-methods-')
+    foreign_path = File.join(foreign_directory, 'foreign.rb')
+    File.write(foreign_path, "module #{@namespace}::Foreign\n def foreign; :ok; end\nend\n")
+    load foreign_path
+    anonymous = Module.new
+    anonymous.module_eval('def anonymous; :ok; end', path, 2)
+    ['First', 'Last'].each { |name| constant(name).include(constant('Foreign')); constant(name).include(anonymous) }
+    exporter = MegamapEvidence::Exporter.new(@root, 'rejected reflection')
+    sources = exporter.instance_variable_get(:@sources)
+    original_location = sources.method(:location)
+    locations = Hash.new(0)
+    sources.define_singleton_method(:location) do |file, line|
+      locations[[file, line]] += 1
+      original_location.call(file, line)
+    end
+    owners = nil
+    document = with_owner_counts { |counts| owners = counts; exporter.export(nil) }
+    assert_equal 1, locations[[foreign_path, 2]], 'a rejected external source location is not revalidated per receiver'
+    assert_equal 0, owners[constant('Foreign')], 'external method owners need no export metadata'
+    assert_equal 2, owners[anonymous], 'an anonymous owner remains retryable if it is named later'
+    assert_empty document.fetch('method_definitions')
+    assert document.fetch('classes').all? { |entry| entry.fetch('method_refs').empty? }
+  ensure
+    FileUtils.remove_entry(foreign_directory) if foreign_directory && File.exist?(foreign_directory)
+  end
+
+  def test_anonymous_owner_named_during_export_is_available_to_later_receivers
+    path = source('classes.rb', "class First; end\nclass Last; end")
+    anonymous = Module.new
+    anonymous.module_eval('def generated; :ok; end', path, 2)
+    ['First', 'Last'].each { |name| constant(name).include(anonymous) }
+    original = MegamapEvidence.method(:owner_name)
+    seen = 0
+    namespace = Object.const_get(@namespace)
+    MegamapEvidence.define_singleton_method(:owner_name) do |owner|
+      value = original.call(owner)
+      if owner.equal?(anonymous)
+        seen += 1
+        namespace.const_set(:NamedLater, owner) if seen == 1
+      end
+      value
+    end
+    document = MegamapEvidence.snapshot(root: @root)
+    last = document.fetch('classes').find { |entry| entry['name'] == "#{@namespace}::Last" }
+    assert_equal 2, seen
+    generated = methods(document, last).find { |method| method['name'] == 'generated' }
+    assert_equal "#{@namespace}::NamedLater#generated", generated.fetch('definition_name')
+  ensure
+    MegamapEvidence.define_singleton_method(:owner_name, original) if original
+  end
+
   def test_observed_calls_keep_definition_and_callsite_locations_and_aggregate_counts
     source('company.rb', "class Company\n def run; :ok; end\nend")
     source('worker.rb', "class Worker\n def perform(target)\n  target.run\n end\nend")
@@ -61,7 +222,7 @@ class RuntimeEvidenceTest < Minitest::Test
     refute_nil company
     assert_equal 'company.rb', company.fetch('file')
     assert_equal 5, company.fetch('line')
-    run = company.fetch('methods').find { |entry| entry['name'] == 'run' && !entry['singleton'] }
+    run = methods(document, company).find { |entry| entry['name'] == 'run' && !entry['singleton'] }
     assert_equal "#{@namespace}::Work", run.fetch('owner')
     assert_equal "#{@namespace}::Work#run", run.fetch('definition_name')
     assert_equal 'company.rb', run.fetch('file')
@@ -70,9 +231,10 @@ class RuntimeEvidenceTest < Minitest::Test
 
   def test_extended_module_methods_keep_their_definition_side_and_alias_names
     source('company.rb', "module Work\n def run; :ok; end\n alias another run\nend\nclass Company\n extend Work\nend")
-    company = MegamapEvidence.snapshot(root: @root).fetch('classes').find { |entry| entry['name'] == "#{@namespace}::Company" }
-    run = company.fetch('methods').find { |entry| entry['name'] == 'run' && entry['singleton'] }
-    another = company.fetch('methods').find { |entry| entry['name'] == 'another' && entry['singleton'] }
+    document = MegamapEvidence.snapshot(root: @root)
+    company = document.fetch('classes').find { |entry| entry['name'] == "#{@namespace}::Company" }
+    run = methods(document, company).find { |entry| entry['name'] == 'run' && entry['singleton'] }
+    another = methods(document, company).find { |entry| entry['name'] == 'another' && entry['singleton'] }
     assert_equal "#{@namespace}::Work#run", run.fetch('definition_name')
     assert_equal "#{@namespace}::Work#run", another.fetch('definition_name')
     assert_equal "#{@namespace}::Work", another.fetch('owner')
@@ -88,7 +250,7 @@ class RuntimeEvidenceTest < Minitest::Test
     assert_equal "#{@namespace}::Company#run", call.dig('callee', 'name')
     assert_equal 3, call.dig('callee', 'line')
     company = document.fetch('classes').find { |entry| entry['name'] == "#{@namespace}::Company" }
-    assert_equal 3, company.fetch('methods').find { |entry| entry['name'] == 'run' }.fetch('line')
+    assert_equal 3, methods(document, company).find { |entry| entry['name'] == 'run' }.fetch('line')
   end
 
   def test_threads_and_suspended_fibers_do_not_share_caller_frames
@@ -259,7 +421,8 @@ class RuntimeEvidenceTest < Minitest::Test
     document = MegamapEvidence.snapshot(root: @root)
     assert_equal ['a_worker.rb', 'extra.rb', 'z_configure.rb'], document.fetch('context_files')
     assert_equal MegamapEvidence.fingerprint(File.binread(File.join(@root, 'z_configure.rb'))), document.fetch('files').fetch('z_configure.rb')
-    assert document.fetch('classes').find { |entry| entry['name'] == "#{@namespace}::Worker" }.fetch('methods').any? { |method| method['owner'] == "#{@namespace}::Extra" }
+    worker = document.fetch('classes').find { |entry| entry['name'] == "#{@namespace}::Worker" }
+    assert methods(document, worker).any? { |method| method['owner'] == "#{@namespace}::Extra" }
   end
 
   def test_context_uses_the_viewer_source_file_boundary_and_git_ignore_rules
